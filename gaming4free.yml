@@ -1,0 +1,73 @@
+﻿name: Game4Free 自动续期
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 1 * * *'
+jobs:
+  renew:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          lfs: false
+      - name: 配置 Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      - name: 安装系统依赖
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y xvfb xdotool wget \
+            libnss3 libatk1.0-0 libatk-bridge2.0-0 \
+            libcups2 libdrm2 libxkbcommon0 \
+            libxcomposite1 libxrandr2 libgbm1 \
+            libpango-1.0-0 libcairo2 fonts-liberation \
+            libasound2t64 libxss1 libxdamage1 libxfixes3
+      - name: 安装 Python 依赖
+        working-directory: gaming4free-renew
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: 配置代理 (sing-box)
+        continue-on-error: true
+        env:
+          NODE_LINK: ${{ secrets.PROXY_URL }}
+        run: |
+          if [ -n "$NODE_LINK" ]; then
+            bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
+            sleep 5
+            if curl -x "socks5://127.0.0.1:1080" --max-time 5 -s https://api.ipify.org > /dev/null 2>&1; then
+              echo "IS_PROXY=true" >> $GITHUB_ENV
+              echo "代理连通性测试通过"
+            else
+              echo "代理连通性测试失败，将直连"
+            fi
+          fi
+      - name: 运行续期脚本
+        env:
+          PYTHONIOENCODING: utf-8
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          GAME4FREE_RENEW_URL: ${{ secrets.GAME4FREE_RENEW_URL }}
+          GAME4FREE_COOKIE: ${{ secrets.GAME4FREE_COOKIE }}
+          GAME4FREE_ACCOUNTS: ${{ secrets.GAME4FREE_ACCOUNTS }}
+          GAME4FREE_ACCOUNT: ${{ secrets.GAME4FREE_ACCOUNT }}
+          PROXY_URL: ${{ secrets.PROXY_URL }}
+          # SeleniumBase 会自动管理 Chrome/Chromedriver，无需手动指定
+          SB_SKIP_DRIVER_UPDATE: "true"
+        working-directory: gaming4free-renew
+        run: |
+          xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python renew.py
+      - name: 上传调试截图
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-screenshots
+          path: gaming4free-renew/debug_output/
+          if-no-files-found: warn
+          retention-days: 3
