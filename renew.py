@@ -228,7 +228,7 @@ def click_renew_button(sb) -> bool:
         log.warning(f"点击 VOTE 按钮失败: {e}")
         return False
 
-    time.sleep(3)
+    time.sleep(5)
 
     try:
         submit_btn = sb.execute_script("""
@@ -241,12 +241,75 @@ def click_renew_button(sb) -> bool:
         el.click();
         return 'clicked:' + el.innerText.trim();
         """)
-        if not submit_btn or not str(submit_btn).startswith("clicked:"):
-            log.warning(f"VOTE 提交按钮未找到: {submit_btn}")
-            screenshot(sb, "vote_modal_fail")
-            return False
-        log.info(f"✅ 点击 VOTE 提交: {submit_btn}")
-        return True
+        if submit_btn and str(submit_btn).startswith("clicked:"):
+            log.info(f"✅ 点击 VOTE 提交: {submit_btn}")
+            return True
+
+        log.warning(f"VOTE 提交按钮状态: {submit_btn}，尝试诊断弹窗...")
+
+        diag = sb.execute_script("""
+        var out = [];
+        var modal = document.querySelector('.vote-modal, .vm-modal, [class*="vote"], [class*="vm-"]');
+        if (modal) out.push('modal class=' + modal.className);
+
+        var iframes = document.querySelectorAll('iframe');
+        out.push('iframes: ' + iframes.length);
+        for (var i = 0; i < iframes.length; i++) {
+            out.push('  iframe[' + i + '] src=' + (iframes[i].src||'').substring(0,120) + ' visible=' + (iframes[i].offsetParent !== null));
+        }
+
+        var checks = document.querySelectorAll('input[type=checkbox], input[type=radio]');
+        for (var i = 0; i < checks.length; i++) {
+            out.push('  input type=' + checks[i].type + ' name=' + checks[i].name + ' checked=' + checks[i].checked + ' disabled=' + checks[i].disabled);
+        }
+
+        var allBtns = document.querySelectorAll('.vm-submit, .vm-close, [class*="vm-"], button');
+        for (var i = 0; i < allBtns.length && i < 20; i++) {
+            var b = allBtns[i];
+            var t = (b.innerText||'').trim().substring(0,50);
+            if (!t) continue;
+            out.push('  btn: ' + b.tagName + ' class="' + (b.className||'').substring(0,60) + '" text="' + t + '" disabled=' + b.disabled);
+        }
+
+        var turnstile = document.querySelector('[class*="turnstile"], [class*="captcha"], [class*="hcaptcha"], #cf-turnstile, .h-captcha');
+        if (turnstile) out.push('CAPTCHA found: class=' + turnstile.className);
+
+        return out.join('\\n');
+        """)
+        if diag:
+            log.info("=== 投票弹窗诊断 ===\n" + str(diag) + "\n=== 诊断结束 ===")
+
+        try:
+            ads_btn = sb.execute_script("""
+            var btns = document.querySelectorAll('button, a, [role=button]');
+            for (var i = 0; i < btns.length; i++) {
+                var t = (btns[i].innerText||'').trim().toLowerCase();
+                if (t.indexOf('enable ads') !== -1 || t.indexOf('watch') !== -1 || t.indexOf('continue') !== -1) {
+                    if (!btns[i].disabled && btns[i].offsetParent !== null) {
+                        btns[i].click();
+                        return 'clicked:' + btns[i].innerText.trim();
+                    }
+                }
+            }
+            return 'not_found';
+            """)
+            if ads_btn and str(ads_btn).startswith("clicked:"):
+                log.info(f"✅ 点击广告/继续按钮: {ads_btn}")
+                time.sleep(5)
+                submit_btn = sb.execute_script("""
+                var el = document.querySelector('.vm-submit');
+                if (!el || el.disabled) return 'still_disabled';
+                el.click();
+                return 'clicked:' + el.innerText.trim();
+                """)
+                if submit_btn and str(submit_btn).startswith("clicked:"):
+                    log.info(f"✅ 广告后点击 VOTE 提交: {submit_btn}")
+                    return True
+        except Exception:
+            pass
+
+        screenshot(sb, "vote_modal_fail")
+        return False
     except Exception as e:
         log.warning(f"点击 VOTE 提交失败: {e}")
         return False
