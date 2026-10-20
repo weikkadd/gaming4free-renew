@@ -210,37 +210,30 @@ def livewire_extend(sb) -> dict:
 def click_renew_button(sb) -> bool:
     """找到并点击续期按钮（JS 方式，不依赖 :contains() 伪选择器）"""
     js_find_and_click = """
-    (function(){
-        var btns = document.querySelectorAll('button, a, [role=button], input[type=submit], input[type=button]');
-        var keywords = ['90', 'renew', 'extend', '续期', '增加', '+90'];
-        for (var i = 0; i < btns.length; i++) {
-            var el = btns[i];
-            var t = (el.innerText || el.textContent || el.value || '').trim();
-            if (!t || t.length > 40) continue;
-            var tl = t.toLowerCase();
-            var match = false;
-            for (var k = 0; k < keywords.length; k++) {
-                if (tl.indexOf(keywords[k].toLowerCase()) !== -1) { match = true; break; }
-            }
-            if (!match) continue;
-            if (el.disabled) continue;
-            var rect = el.getBoundingClientRect();
-            if (rect.width === 0 || rect.height === 0) continue;
-            el.scrollIntoView({block: 'center', behavior: 'instant'});
-            var r2 = el.getBoundingClientRect();
-            var cx = r2.left + r2.width / 2, cy = r2.top + r2.height / 2;
-            var opts = {bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy, button: 0};
-            el.dispatchEvent(new MouseEvent('mousedown', opts));
-            el.dispatchEvent(new MouseEvent('mouseup', opts));
-            el.dispatchEvent(new MouseEvent('click', opts));
-            return 'clicked:' + el.tagName + ' | text="' + t + '" | class="' + (el.className||'').substring(0,80) + '"';
+    var btns = document.querySelectorAll('button, a, [role=button], input[type=submit], input[type=button]');
+    var keywords = ['90', 'renew', 'extend', '续期', '增加'];
+    for (var i = 0; i < btns.length; i++) {
+        var el = btns[i];
+        var t = (el.innerText || el.textContent || el.value || '').trim();
+        if (!t || t.length > 40) continue;
+        var tl = t.toLowerCase();
+        var match = false;
+        for (var k = 0; k < keywords.length; k++) {
+            if (tl.indexOf(keywords[k].toLowerCase()) !== -1) { match = true; break; }
         }
-        return 'not_found';
-    })();
+        if (!match) continue;
+        if (el.disabled) continue;
+        var rect = el.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) continue;
+        el.scrollIntoView({block: 'center'});
+        el.click();
+        return 'clicked:' + el.tagName + ' text=' + t;
+    }
+    return 'not_found';
     """
     try:
         result = sb.execute_script(js_find_and_click)
-        if result and result.startswith("clicked:"):
+        if result and str(result).startswith("clicked:"):
             log.info(f"✅ JS 点击续期按钮: {result}")
             return True
         log.info(f"JS 按钮搜索结果: {result}")
@@ -250,23 +243,29 @@ def click_renew_button(sb) -> bool:
     log.warning("未找到续期按钮")
     try:
         diag_js = """
-        (function(){
-            var btns = document.querySelectorAll('button, a, [role=button], input[type=submit], input[type=button]');
-            var out = [];
-            for (var i = 0; i < btns.length && i < 50; i++) {
-                var el = btns[i];
-                var t = (el.innerText || el.textContent || el.value || '').trim().substring(0, 60);
-                if (!t) continue;
-                out.push(el.tagName + ' | text="' + t + '" | class="' + (el.className||'').substring(0,60) + '" | wire:click="' + (el.getAttribute('wire\\\\:click')||'') + '" | onclick="' + (el.getAttribute('onclick')||'').substring(0,60) + '"');
-            }
-            return out.join('\\n');
-        })();
+        var btns = document.querySelectorAll('button, a, [role=button], input[type=submit], input[type=button]');
+        var out = [];
+        for (var i = 0; i < btns.length && i < 60; i++) {
+            var el = btns[i];
+            var t = (el.innerText || el.textContent || el.value || '').trim().substring(0, 80);
+            if (!t) continue;
+            out.push(el.tagName + ' | text="' + t + '" | class="' + (el.className||'').substring(0,80) + '" | wire:click="' + (el.getAttribute('wire\\:click')||'') + '"');
+        }
+        return out.join('\\n');
         """
         diag = sb.execute_script(diag_js)
         if diag:
-            log.info("=== 页面按钮诊断 ===\n" + diag + "\n=== 诊断结束 ===")
+            log.info("=== 页面按钮诊断 ===\n" + str(diag) + "\n=== 诊断结束 ===")
     except Exception as e:
         log.warning(f"按钮诊断失败: {e}")
+
+    try:
+        html = sb.get_page_source()
+        with open("debug_output/page.html", "w", encoding="utf-8") as f:
+            f.write(html)
+        log.info("页面 HTML 已保存到 debug_output/page.html")
+    except Exception as e:
+        log.warning(f"保存 HTML 失败: {e}")
     return False
 
 
