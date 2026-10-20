@@ -30,17 +30,14 @@ USERNAME       = os.getenv("GAME4FREE_USERNAME", "")
 PASSWORD       = os.getenv("GAME4FREE_PASSWORD", "")
 COOKIE_STR     = os.getenv("GAME4FREE_COOKIE", "")
 
-# 代理地址：sing-box 默认监听 127.0.0.1:1080
-# SeleniumBase 的 proxy= 参数需要 http/https 格式，SOCKS5 会导致连接被拒绝
 _raw_proxy = os.getenv("PROXY_URL", "").strip()
-if "?" in _raw_proxy or "://" not in _raw_proxy:
-    PROXY_URL = "http://127.0.0.1:1080"
+_is_proxy = os.getenv("IS_PROXY", "").strip().lower() in ("true", "1", "yes")
+if _is_proxy:
+    PROXY_URL = "socks5://127.0.0.1:1080"
+elif _raw_proxy and ("http" in _raw_proxy or "socks" in _raw_proxy):
+    PROXY_URL = _raw_proxy
 else:
-    # 如果传入的是 http://... 就保留，否则用 http
-    if _raw_proxy.startswith("http"):
-        PROXY_URL = _raw_proxy
-    else:
-        PROXY_URL = "http://127.0.0.1:1080"
+    PROXY_URL = "socks5://127.0.0.1:1080"
 
 MAX_HOURS      = 48            # 续期上限 48 小时
 ADD_MINUTES    = 30            # 每次投票 +30 分钟
