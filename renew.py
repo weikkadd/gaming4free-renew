@@ -211,6 +211,7 @@ def click_renew_button(sb) -> bool:
     """gaming4free 续期：点 VOTE + ADD 30 MIN 弹窗 → 点 VOTE — ADDS 30 MINUTES 提交"""
     try:
         vote_btn = sb.execute_script("""
+        (function(){
         var el = document.querySelector('.sp-vote-btn');
         if (!el) return 'not_found';
         if (el.disabled) return 'disabled';
@@ -219,6 +220,7 @@ def click_renew_button(sb) -> bool:
         el.scrollIntoView({block: 'center'});
         el.click();
         return 'clicked:' + el.innerText.trim();
+        })();
         """)
         if not vote_btn or not str(vote_btn).startswith("clicked:"):
             log.warning(f"VOTE 按钮未找到: {vote_btn}")
@@ -232,6 +234,7 @@ def click_renew_button(sb) -> bool:
 
     try:
         submit_btn = sb.execute_script("""
+        (function(){
         var el = document.querySelector('.vm-submit');
         if (!el) return 'not_found';
         if (el.disabled) return 'disabled';
@@ -240,6 +243,7 @@ def click_renew_button(sb) -> bool:
         el.scrollIntoView({block: 'center'});
         el.click();
         return 'clicked:' + el.innerText.trim();
+        })();
         """)
         if submit_btn and str(submit_btn).startswith("clicked:"):
             log.info(f"✅ 点击 VOTE 提交: {submit_btn}")
@@ -248,14 +252,17 @@ def click_renew_button(sb) -> bool:
         log.warning(f"VOTE 提交按钮状态: {submit_btn}，尝试处理验证码...")
 
         captcha_html = sb.execute_script("""
+        (function(){
         var c = document.querySelector('.vm-captcha');
         if (!c) return 'no_captcha_element';
         return c.outerHTML.substring(0, 2000);
+        })();
         """)
         if captcha_html:
             log.info("=== vm-captcha HTML ===\n" + str(captcha_html) + "\n=== 结束 ===")
 
         sb.execute_script("""
+        (function(){
         var c = document.querySelector('.vm-captcha');
         if (c) {
             c.click();
@@ -264,10 +271,12 @@ def click_renew_button(sb) -> bool:
                 try { children[i].click(); } catch(e) {}
             }
         }
+        })();
         """)
         time.sleep(3)
 
         sb.execute_script("""
+        (function(){
         var btns = document.querySelectorAll('button, a, [role=button], div');
         for (var i = 0; i < btns.length; i++) {
             var t = (btns[i].innerText||'').trim().toLowerCase();
@@ -279,16 +288,19 @@ def click_renew_button(sb) -> bool:
                 }
             }
         }
+        })();
         """)
         time.sleep(5)
 
         for wait_round in range(6):
             submit_btn = sb.execute_script("""
+            (function(){
             var el = document.querySelector('.vm-submit');
             if (!el) return 'not_found';
             if (el.disabled) return 'disabled';
             el.click();
             return 'clicked:' + el.innerText.trim();
+            })();
             """)
             if submit_btn and str(submit_btn).startswith("clicked:"):
                 log.info(f"✅ 验证码通过，点击 VOTE 提交: {submit_btn}")
