@@ -282,7 +282,7 @@ def click_renew_button(sb) -> bool:
         """)
         time.sleep(5)
 
-        for wait_round in range(4):
+        for wait_round in range(6):
             submit_btn = sb.execute_script("""
             var el = document.querySelector('.vm-submit');
             if (!el) return 'not_found';
@@ -293,7 +293,7 @@ def click_renew_button(sb) -> bool:
             if submit_btn and str(submit_btn).startswith("clicked:"):
                 log.info(f"✅ 验证码通过，点击 VOTE 提交: {submit_btn}")
                 return True
-            log.info(f"等待验证码通过... ({wait_round+1}/4) submit={submit_btn}")
+            log.info(f"等待验证码通过... ({wait_round+1}/6) submit={submit_btn}")
             time.sleep(5)
 
         screenshot(sb, "vote_modal_fail")
@@ -442,11 +442,11 @@ def run():
     if not proxy_available:
         log.info("代理不可用，使用直连模式")
         PROXY_URL = ""
-    log.info("正在启动浏览器 (uc=False, headless=True)...")
+    log.info("正在启动浏览器 (uc=True, headless=False)...")
     with SB(
         browser="chrome",
-        uc=False,
-        headless=True,
+        uc=True,
+        headless=False,
         incognito=False,
         proxy=PROXY_URL,
         
