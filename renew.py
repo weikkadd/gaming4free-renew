@@ -245,68 +245,56 @@ def click_renew_button(sb) -> bool:
             log.info(f"✅ 点击 VOTE 提交: {submit_btn}")
             return True
 
-        log.warning(f"VOTE 提交按钮状态: {submit_btn}，尝试诊断弹窗...")
+        log.warning(f"VOTE 提交按钮状态: {submit_btn}，尝试处理验证码...")
 
-        diag = sb.execute_script("""
-        var out = [];
-        var modal = document.querySelector('.vote-modal, .vm-modal, [class*="vote"], [class*="vm-"]');
-        if (modal) out.push('modal class=' + modal.className);
-
-        var iframes = document.querySelectorAll('iframe');
-        out.push('iframes: ' + iframes.length);
-        for (var i = 0; i < iframes.length; i++) {
-            out.push('  iframe[' + i + '] src=' + (iframes[i].src||'').substring(0,120) + ' visible=' + (iframes[i].offsetParent !== null));
-        }
-
-        var checks = document.querySelectorAll('input[type=checkbox], input[type=radio]');
-        for (var i = 0; i < checks.length; i++) {
-            out.push('  input type=' + checks[i].type + ' name=' + checks[i].name + ' checked=' + checks[i].checked + ' disabled=' + checks[i].disabled);
-        }
-
-        var allBtns = document.querySelectorAll('.vm-submit, .vm-close, [class*="vm-"], button');
-        for (var i = 0; i < allBtns.length && i < 20; i++) {
-            var b = allBtns[i];
-            var t = (b.innerText||'').trim().substring(0,50);
-            if (!t) continue;
-            out.push('  btn: ' + b.tagName + ' class="' + (b.className||'').substring(0,60) + '" text="' + t + '" disabled=' + b.disabled);
-        }
-
-        var turnstile = document.querySelector('[class*="turnstile"], [class*="captcha"], [class*="hcaptcha"], #cf-turnstile, .h-captcha');
-        if (turnstile) out.push('CAPTCHA found: class=' + turnstile.className);
-
-        return out.join('\\n');
+        captcha_html = sb.execute_script("""
+        var c = document.querySelector('.vm-captcha');
+        if (!c) return 'no_captcha_element';
+        return c.outerHTML.substring(0, 2000);
         """)
-        if diag:
-            log.info("=== 投票弹窗诊断 ===\n" + str(diag) + "\n=== 诊断结束 ===")
+        if captcha_html:
+            log.info("=== vm-captcha HTML ===\n" + str(captcha_html) + "\n=== 结束 ===")
 
-        try:
-            ads_btn = sb.execute_script("""
-            var btns = document.querySelectorAll('button, a, [role=button]');
-            for (var i = 0; i < btns.length; i++) {
-                var t = (btns[i].innerText||'').trim().toLowerCase();
-                if (t.indexOf('enable ads') !== -1 || t.indexOf('watch') !== -1 || t.indexOf('continue') !== -1) {
-                    if (!btns[i].disabled && btns[i].offsetParent !== null) {
-                        btns[i].click();
-                        return 'clicked:' + btns[i].innerText.trim();
-                    }
+        sb.execute_script("""
+        var c = document.querySelector('.vm-captcha');
+        if (c) {
+            c.click();
+            var children = c.querySelectorAll('*');
+            for (var i = 0; i < children.length && i < 10; i++) {
+                try { children[i].click(); } catch(e) {}
+            }
+        }
+        """)
+        time.sleep(3)
+
+        sb.execute_script("""
+        var btns = document.querySelectorAll('button, a, [role=button], div');
+        for (var i = 0; i < btns.length; i++) {
+            var t = (btns[i].innerText||'').trim().toLowerCase();
+            if (t.indexOf('enable ads') !== -1) {
+                var r = btns[i].getBoundingClientRect();
+                if (r.width > 0 && r.height > 0 && !btns[i].disabled) {
+                    btns[i].click();
+                    return;
                 }
             }
-            return 'not_found';
+        }
+        """)
+        time.sleep(5)
+
+        for wait_round in range(4):
+            submit_btn = sb.execute_script("""
+            var el = document.querySelector('.vm-submit');
+            if (!el) return 'not_found';
+            if (el.disabled) return 'disabled';
+            el.click();
+            return 'clicked:' + el.innerText.trim();
             """)
-            if ads_btn and str(ads_btn).startswith("clicked:"):
-                log.info(f"✅ 点击广告/继续按钮: {ads_btn}")
-                time.sleep(5)
-                submit_btn = sb.execute_script("""
-                var el = document.querySelector('.vm-submit');
-                if (!el || el.disabled) return 'still_disabled';
-                el.click();
-                return 'clicked:' + el.innerText.trim();
-                """)
-                if submit_btn and str(submit_btn).startswith("clicked:"):
-                    log.info(f"✅ 广告后点击 VOTE 提交: {submit_btn}")
-                    return True
-        except Exception:
-            pass
+            if submit_btn and str(submit_btn).startswith("clicked:"):
+                log.info(f"✅ 验证码通过，点击 VOTE 提交: {submit_btn}")
+                return True
+            log.info(f"等待验证码通过... ({wait_round+1}/4) submit={submit_btn}")
+            time.sleep(5)
 
         screenshot(sb, "vote_modal_fail")
         return False
