@@ -261,6 +261,34 @@ def click_renew_button(sb) -> bool:
         if captcha_html:
             log.info("=== vm-captcha HTML ===\n" + str(captcha_html) + "\n=== 结束 ===")
 
+        ts_diag = sb.execute_script("""
+        (function(){
+        var out = [];
+        out.push('window.turnstile: ' + (typeof window.turnstile !== 'undefined'));
+        out.push('turnstile.render: ' + (typeof window.turnstile !== 'undefined' && typeof window.turnstile.render === 'function'));
+        var widget = document.querySelector('.cf-turnstile');
+        if (widget) {
+            out.push('sitekey: ' + (widget.getAttribute('data-sitekey') || 'MISSING'));
+            out.push('data-appear: ' + (widget.getAttribute('data-appearance') || ''));
+        }
+        var resp = document.querySelector('[name="cf-turnstile-response"]');
+        out.push('response value: ' + (resp ? (resp.value || 'EMPTY').substring(0,30) : 'no_input'));
+        var tsIframes = document.querySelectorAll('iframe[src*="challenges.cloudflare.com"]');
+        out.push('turnstile iframes: ' + tsIframes.length);
+        for (var i = 0; i < tsIframes.length; i++) {
+            out.push('  ts iframe[' + i + '] src=' + tsIframes[i].src.substring(0,100));
+        }
+        var allScripts = document.querySelectorAll('script[src*="turnstile"]');
+        out.push('turnstile scripts: ' + allScripts.length);
+        for (var i = 0; i < allScripts.length; i++) {
+            out.push('  script src=' + allScripts[i].src);
+        }
+        return out.join('\\n');
+        })();
+        """)
+        if ts_diag:
+            log.info("=== Turnstile 诊断 ===\n" + str(ts_diag) + "\n=== 结束 ===")
+
         sb.execute_script("""
         (function(){
         var c = document.querySelector('.vm-captcha');
