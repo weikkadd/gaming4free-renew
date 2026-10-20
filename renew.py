@@ -294,28 +294,43 @@ def click_renew_button(sb) -> bool:
         var scripts = document.querySelectorAll('script');
         for (var i = 0; i < scripts.length; i++) {
             var content = scripts[i].textContent || '';
-            var match = content.match(/sitekey["'\\s:]+["']([0-9a-zA-Z_x-]{20,})["']/);
-            if (match) return match[1];
+            var match = content.match(/(0x[0-9a-zA-Z_]{15,})/);
+            if (match) return 'script:' + match[1];
         }
-        var widget = document.querySelector('.cf-turnstile');
-        if (widget) {
-            var sk = widget.getAttribute('data-sitekey');
-            if (sk) return sk;
+        var wireEls = document.querySelectorAll('[wire\\\\:initial-data]');
+        for (var i = 0; i < wireEls.length; i++) {
+            var data = wireEls[i].getAttribute('wire:initial-data') || '';
+            var match = data.match(/(0x[0-9a-zA-Z_]{15,})/);
+            if (match) return 'wire:' + match[1];
         }
-        var allEls = document.querySelectorAll('[data-sitekey]');
-        if (allEls.length > 0) return allEls[0].getAttribute('data-sitekey');
+        var allEls = document.querySelectorAll('*');
+        for (var i = 0; i < allEls.length && i < 500; i++) {
+            var attrs = allEls[i].attributes;
+            for (var j = 0; j < attrs.length; j++) {
+                if (attrs[j].name.toLowerCase().indexOf('sitekey') !== -1) return 'attr:' + attrs[j].value;
+                var m = attrs[j].value.match(/^(0x[0-9a-zA-Z_]{15,})$/);
+                if (m) return 'attrval:' + m[1];
+            }
+        }
+        for (var key in window) {
+            try {
+                var v = window[key];
+                if (typeof v === 'string' && v.match(/^0x[0-9a-zA-Z_]{15,}$/)) return 'window.' + key + ':' + v;
+            } catch(e) {}
+        }
         return '';
         })();
         """)
         if sitekey_result:
-            log.info(f"找到 Turnstile sitekey: {sitekey_result}")
+            sitekey = str(sitekey_result).split(":")[-1]
+            log.info(f"找到 Turnstile sitekey: {sitekey_result} -> {sitekey}")
             sb.execute_script(f"""
             (function(){{
             var widget = document.querySelector('.cf-turnstile');
             if (widget && window.turnstile) {{
                 try {{
                     var widgetId = window.turnstile.render(widget, {{
-                        sitekey: '{sitekey_result}',
+                        sitekey: '{sitekey}',
                         theme: 'dark',
                         callback: function(token) {{
                             var input = document.querySelector('[name="cf-turnstile-response"]');
@@ -338,7 +353,14 @@ def click_renew_button(sb) -> bool:
             """)
             log.info(f"Turnstile render 后 response: {ts_resp}")
         else:
-            log.warning("未找到 Turnstile sitekey")
+            log.warning("未找到 Turnstile sitekey，dump 页面 HTML")
+            try:
+                html = sb.get_page_source()
+                with open("debug_output/page.html", "w", encoding="utf-8") as f:
+                    f.write(html)
+                log.info("页面 HTML 已保存到 debug_output/page.html")
+            except Exception as e:
+                log.warning(f"保存 HTML 失败: {e}")
 
         sb.execute_script("""
         (function(){
