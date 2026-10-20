@@ -71,6 +71,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: debug-screenshots
-          path: gaming4free-renew/debug_output/
+          path: debug_output/
           if-no-files-found: warn
           retention-days: 3

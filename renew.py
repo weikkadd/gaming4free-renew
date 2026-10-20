@@ -52,7 +52,7 @@ TURNSTILE_WAIT = 90            # Turnstile 等待上限
 TG_TOKEN       = os.getenv("TG_BOT_TOKEN", "")
 TG_CHAT_ID     = os.getenv("TG_CHAT_ID", "")
 
-SHOT_DIR       = Path("screenshots")
+SHOT_DIR       = Path("debug_output")
 SHOT_DIR.mkdir(exist_ok=True)
 
 # ---------------------------------------------------------------------------
@@ -236,6 +236,25 @@ def click_renew_button(sb) -> bool:
         except Exception:
             continue
     log.warning("未找到续期按钮")
+    try:
+        diag_js = """
+        (function(){
+            var btns = document.querySelectorAll('button, a, [role=button], input[type=submit], input[type=button]');
+            var out = [];
+            for (var i = 0; i < btns.length && i < 50; i++) {
+                var el = btns[i];
+                var t = (el.innerText || el.textContent || el.value || '').trim().substring(0, 60);
+                if (!t) continue;
+                out.push(el.tagName + ' | text="' + t + '" | class="' + (el.className||'').substring(0,60) + '" | wire:click="' + (el.getAttribute('wire\\\\:click')||'') + '" | onclick="' + (el.getAttribute('onclick')||'').substring(0,60) + '"');
+            }
+            return out.join('\\n');
+        })();
+        """
+        diag = sb.execute_script(diag_js)
+        if diag:
+            log.info("=== 页面按钮诊断 ===\n" + diag + "\n=== 诊断结束 ===")
+    except Exception as e:
+        log.warning(f"按钮诊断失败: {e}")
     return False
 
 
