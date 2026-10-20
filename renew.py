@@ -24,11 +24,11 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 # 配置区
 # ---------------------------------------------------------------------------
-SITE_URL       = os.getenv("GF_SITE_URL", "https://gaming4free.zapto.org/")
-LOGIN_URL      = os.getenv("GF_LOGIN_URL", "")
-USERNAME       = os.getenv("MC_USERNAME", "")
-PASSWORD       = os.getenv("MC_PASSWORD", "")
-COOKIE_STR     = os.getenv("GF_COOKIE", "")
+SITE_URL       = os.getenv("GAME4FREE_RENEW_URL", "https://control.gaming4free.net/")
+LOGIN_URL      = os.getenv("GAME4FREE_LOGIN_URL", "")
+USERNAME       = os.getenv("GAME4FREE_USERNAME", "")
+PASSWORD       = os.getenv("GAME4FREE_PASSWORD", "")
+COOKIE_STR     = os.getenv("GAME4FREE_COOKIE", "")
 
 # 代理地址：sing-box 默认监听 127.0.0.1:1080
 # SeleniumBase 的 proxy= 参数需要 http/https 格式，SOCKS5 会导致连接被拒绝
