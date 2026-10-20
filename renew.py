@@ -289,6 +289,57 @@ def click_renew_button(sb) -> bool:
         if ts_diag:
             log.info("=== Turnstile 诊断 ===\n" + str(ts_diag) + "\n=== 结束 ===")
 
+        sitekey_result = sb.execute_script("""
+        (function(){
+        var scripts = document.querySelectorAll('script');
+        for (var i = 0; i < scripts.length; i++) {
+            var content = scripts[i].textContent || '';
+            var match = content.match(/sitekey["'\\s:]+["']([0-9a-zA-Z_x-]{20,})["']/);
+            if (match) return match[1];
+        }
+        var widget = document.querySelector('.cf-turnstile');
+        if (widget) {
+            var sk = widget.getAttribute('data-sitekey');
+            if (sk) return sk;
+        }
+        var allEls = document.querySelectorAll('[data-sitekey]');
+        if (allEls.length > 0) return allEls[0].getAttribute('data-sitekey');
+        return '';
+        })();
+        """)
+        if sitekey_result:
+            log.info(f"找到 Turnstile sitekey: {sitekey_result}")
+            sb.execute_script(f"""
+            (function(){{
+            var widget = document.querySelector('.cf-turnstile');
+            if (widget && window.turnstile) {{
+                try {{
+                    var widgetId = window.turnstile.render(widget, {{
+                        sitekey: '{sitekey_result}',
+                        theme: 'dark',
+                        callback: function(token) {{
+                            var input = document.querySelector('[name="cf-turnstile-response"]');
+                            if (input) input.value = token;
+                        }}
+                    }});
+                    window.__tsWidgetId = widgetId;
+                }} catch(e) {{
+                    window.__tsError = e.toString();
+                }}
+            }}
+            }})();
+            """)
+            time.sleep(8)
+            ts_resp = sb.execute_script("""
+            (function(){
+            var input = document.querySelector('[name="cf-turnstile-response"]');
+            return (input && input.value) ? 'has_token:' + input.value.substring(0,20) : 'no_token';
+            })();
+            """)
+            log.info(f"Turnstile render 后 response: {ts_resp}")
+        else:
+            log.warning("未找到 Turnstile sitekey")
+
         sb.execute_script("""
         (function(){
         var c = document.querySelector('.vm-captcha');
