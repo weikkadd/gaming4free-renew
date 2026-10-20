@@ -208,33 +208,45 @@ def livewire_extend(sb) -> dict:
 
 
 def click_renew_button(sb) -> bool:
-    """找到并点击续期按钮（备用方案）"""
-    candidates = [
-        'button:contains("+90")',
-        'button:contains("90 min")',
-        'button:contains("90")',
-        'a:contains("+90")',
-        'a:contains("90 min")',
-        'button:contains("Renew")',
-        'button:contains("Extend")',
-        'button:contains("续期")',
-        'button:contains("增加")',
-        'a:contains("Renew")',
-    ]
-    for sel in candidates:
-        try:
-            if sb.is_element_visible(sel, timeout=5):
-                human_sleep(1.0, 2.5)
-                sb.scroll_to(sel)
-                human_sleep(0.3, 0.8)
-                try:
-                    sb.click(sel, timeout=8)
-                except Exception:
-                    sb.execute_script("document.querySelector(arguments[0]).click();", sel)
-                log.info(f"点击续期按钮 [{sel}]")
-                return True
-        except Exception:
-            continue
+    """找到并点击续期按钮（JS 方式，不依赖 :contains() 伪选择器）"""
+    js_find_and_click = """
+    (function(){
+        var btns = document.querySelectorAll('button, a, [role=button], input[type=submit], input[type=button]');
+        var keywords = ['90', 'renew', 'extend', '续期', '增加', '+90'];
+        for (var i = 0; i < btns.length; i++) {
+            var el = btns[i];
+            var t = (el.innerText || el.textContent || el.value || '').trim();
+            if (!t || t.length > 40) continue;
+            var tl = t.toLowerCase();
+            var match = false;
+            for (var k = 0; k < keywords.length; k++) {
+                if (tl.indexOf(keywords[k].toLowerCase()) !== -1) { match = true; break; }
+            }
+            if (!match) continue;
+            if (el.disabled) continue;
+            var rect = el.getBoundingClientRect();
+            if (rect.width === 0 || rect.height === 0) continue;
+            el.scrollIntoView({block: 'center', behavior: 'instant'});
+            var r2 = el.getBoundingClientRect();
+            var cx = r2.left + r2.width / 2, cy = r2.top + r2.height / 2;
+            var opts = {bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy, button: 0};
+            el.dispatchEvent(new MouseEvent('mousedown', opts));
+            el.dispatchEvent(new MouseEvent('mouseup', opts));
+            el.dispatchEvent(new MouseEvent('click', opts));
+            return 'clicked:' + el.tagName + ' | text="' + t + '" | class="' + (el.className||'').substring(0,80) + '"';
+        }
+        return 'not_found';
+    })();
+    """
+    try:
+        result = sb.execute_script(js_find_and_click)
+        if result and result.startswith("clicked:"):
+            log.info(f"✅ JS 点击续期按钮: {result}")
+            return True
+        log.info(f"JS 按钮搜索结果: {result}")
+    except Exception as e:
+        log.warning(f"JS 按钮点击失败: {e}")
+
     log.warning("未找到续期按钮")
     try:
         diag_js = """
