@@ -43,9 +43,9 @@ else:
         PROXY_URL = "http://127.0.0.1:1080"
 
 MAX_HOURS      = 48            # 续期上限 48 小时
-ADD_MINUTES    = 90            # 每次点击 +90 分钟
+ADD_MINUTES    = 30            # 每次投票 +30 分钟
 COOLDOWN_SEC   = 240           # 冷却 4 分钟
-MAX_CLICKS     = 30            # 单次运行最大点击次数（防死循环）
+MAX_CLICKS     = 80            # 单次运行最大投票次数
 PAGE_TIMEOUT   = 60            # 单页操作超时
 TURNSTILE_WAIT = 90            # Turnstile 等待上限
 
@@ -208,65 +208,48 @@ def livewire_extend(sb) -> dict:
 
 
 def click_renew_button(sb) -> bool:
-    """找到并点击续期按钮（JS 方式，不依赖 :contains() 伪选择器）"""
-    js_find_and_click = """
-    var btns = document.querySelectorAll('button, a, [role=button], input[type=submit], input[type=button]');
-    var keywords = ['90', 'renew', 'extend', '续期', '增加'];
-    for (var i = 0; i < btns.length; i++) {
-        var el = btns[i];
-        var t = (el.innerText || el.textContent || el.value || '').trim();
-        if (!t || t.length > 40) continue;
-        var tl = t.toLowerCase();
-        var match = false;
-        for (var k = 0; k < keywords.length; k++) {
-            if (tl.indexOf(keywords[k].toLowerCase()) !== -1) { match = true; break; }
-        }
-        if (!match) continue;
-        if (el.disabled) continue;
-        var rect = el.getBoundingClientRect();
-        if (rect.width === 0 || rect.height === 0) continue;
+    """gaming4free 续期：点 VOTE + ADD 30 MIN 弹窗 → 点 VOTE — ADDS 30 MINUTES 提交"""
+    try:
+        vote_btn = sb.execute_script("""
+        var el = document.querySelector('.sp-vote-btn');
+        if (!el) return 'not_found';
+        if (el.disabled) return 'disabled';
+        var r = el.getBoundingClientRect();
+        if (r.width === 0 || r.height === 0) return 'hidden';
         el.scrollIntoView({block: 'center'});
         el.click();
-        return 'clicked:' + el.tagName + ' text=' + t;
-    }
-    return 'not_found';
-    """
-    try:
-        result = sb.execute_script(js_find_and_click)
-        if result and str(result).startswith("clicked:"):
-            log.info(f"✅ JS 点击续期按钮: {result}")
-            return True
-        log.info(f"JS 按钮搜索结果: {result}")
+        return 'clicked:' + el.innerText.trim();
+        """)
+        if not vote_btn or not str(vote_btn).startswith("clicked:"):
+            log.warning(f"VOTE 按钮未找到: {vote_btn}")
+            return False
+        log.info(f"✅ 点击 VOTE 按钮: {vote_btn}")
     except Exception as e:
-        log.warning(f"JS 按钮点击失败: {e}")
+        log.warning(f"点击 VOTE 按钮失败: {e}")
+        return False
 
-    log.warning("未找到续期按钮")
-    try:
-        diag_js = """
-        var btns = document.querySelectorAll('button, a, [role=button], input[type=submit], input[type=button]');
-        var out = [];
-        for (var i = 0; i < btns.length && i < 60; i++) {
-            var el = btns[i];
-            var t = (el.innerText || el.textContent || el.value || '').trim().substring(0, 80);
-            if (!t) continue;
-            out.push(el.tagName + ' | text="' + t + '" | class="' + (el.className||'').substring(0,80) + '" | wire:click="' + (el.getAttribute('wire\\:click')||'') + '"');
-        }
-        return out.join('\\n');
-        """
-        diag = sb.execute_script(diag_js)
-        if diag:
-            log.info("=== 页面按钮诊断 ===\n" + str(diag) + "\n=== 诊断结束 ===")
-    except Exception as e:
-        log.warning(f"按钮诊断失败: {e}")
+    time.sleep(3)
 
     try:
-        html = sb.get_page_source()
-        with open("debug_output/page.html", "w", encoding="utf-8") as f:
-            f.write(html)
-        log.info("页面 HTML 已保存到 debug_output/page.html")
+        submit_btn = sb.execute_script("""
+        var el = document.querySelector('.vm-submit');
+        if (!el) return 'not_found';
+        if (el.disabled) return 'disabled';
+        var r = el.getBoundingClientRect();
+        if (r.width === 0 || r.height === 0) return 'hidden';
+        el.scrollIntoView({block: 'center'});
+        el.click();
+        return 'clicked:' + el.innerText.trim();
+        """)
+        if not submit_btn or not str(submit_btn).startswith("clicked:"):
+            log.warning(f"VOTE 提交按钮未找到: {submit_btn}")
+            screenshot(sb, "vote_modal_fail")
+            return False
+        log.info(f"✅ 点击 VOTE 提交: {submit_btn}")
+        return True
     except Exception as e:
-        log.warning(f"保存 HTML 失败: {e}")
-    return False
+        log.warning(f"点击 VOTE 提交失败: {e}")
+        return False
 
 
 def handle_turnstile(sb) -> bool:
