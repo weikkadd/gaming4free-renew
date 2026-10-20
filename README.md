@@ -8,7 +8,7 @@ GitHub Actions + SeleniumBase UC mode + Cloudflare Turnstile 验证。
 
 ```
 gaming4free-renew/
-├── main.py           # 主脚本 (单文件, 无外部模块依赖)
+├── renew.py          # 主脚本 (单文件, 无外部模块依赖)
 ├── requirements.txt  # Python 依赖
 └── README.md         # 说明文档
 ```
@@ -33,7 +33,7 @@ gaming4free-renew/
 ### 3. 运行
 
 ```bash
-xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python main.py
+xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python renew.py
 ```
 
 ## 工作原理

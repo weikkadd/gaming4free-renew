@@ -1,4 +1,4 @@
-﻿import re
+import re
 from util import log
 def chk_cd(dr):
     try:

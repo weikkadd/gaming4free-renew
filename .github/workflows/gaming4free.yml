@@ -1,4 +1,4 @@
-﻿name: Game4Free 自动续期
+name: Game4Free 自动续期
 on:
   workflow_dispatch:
   schedule:
@@ -29,7 +29,7 @@ jobs:
             libpango-1.0-0 libcairo2 fonts-liberation \
             libasound2t64 libxss1 libxdamage1 libxfixes3
       - name: 安装 Python 依赖
-        working-directory: gaming4free-renew
+        working-directory: .
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
@@ -60,7 +60,7 @@ jobs:
           PROXY_URL: ${{ secrets.PROXY_URL }}
           # SeleniumBase 会自动管理 Chrome/Chromedriver，无需手动指定
           SB_SKIP_DRIVER_UPDATE: "true"
-        working-directory: gaming4free-renew
+        working-directory: .
         run: |
           xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python renew.py
       - name: 上传调试截图

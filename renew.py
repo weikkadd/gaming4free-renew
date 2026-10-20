@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 gaming4free 自动续期脚本（GHA + sing-box proxy + seleniumbase UC mode）

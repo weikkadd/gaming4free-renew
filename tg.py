@@ -1,4 +1,4 @@
-﻿import urllib.request, urllib.parse
+import urllib.request, urllib.parse
 from datetime import datetime
 from util import log
 from cfg import *

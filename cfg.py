@@ -1,4 +1,4 @@
-﻿import os
+import os
 import sys
 
 RENEW_URL = os.environ.get("GAME4FREE_RENEW_URL", "").strip()
