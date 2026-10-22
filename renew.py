@@ -417,7 +417,14 @@ def handle_turnstile(sb) -> bool:
     """处理 Cloudflare Turnstile，返回是否通过"""
     try:
         iframe_sel = 'iframe[src*="challenges.cloudflare.com"]'
-        if not sb.is_element_present(iframe_sel, timeout=3):
+        # seleniumbase 新版 is_element_present() 不接受 timeout 参数；
+        # 用 wait_for_element_present 做限时等待并捕获超时异常
+        try:
+            sb.wait_for_element_present(iframe_sel, timeout=3)
+            iframe_present = True
+        except Exception:
+            iframe_present = False
+        if not iframe_present:
             log.info("未检测到 Turnstile iframe，跳过")
             return True
 
