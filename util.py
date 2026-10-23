@@ -164,27 +164,22 @@ _LW_V2_JS = """
 _LW_CLICK_JS = """
 (function(){
     try {
-        var allEls = document.querySelectorAll('*');
+        // 只遍历可点击元素，并限制文本长度，避免 <html>/父容器（textContent 含整页文本）误命中
+        var candidates = document.querySelectorAll('button, a, [role=button], [wire\\\\:click], [wire\\\\:click\\\\.prevent], [wire\\\\:click\\\\.stop]');
         var target = null, wireAttr = null;
-        for (var i = 0; i < allEls.length; i++) {
-            var el = allEls[i];
+        for (var i = 0; i < candidates.length; i++) {
+            var el = candidates[i];
             var t = (el.innerText || el.textContent || '').trim();
-            if (t.indexOf('90') !== -1 && t.indexOf('min') !== -1) {
+            if (t.length > 0 && t.length <= 120 && /min/i.test(t)) {
                 var rect = el.getBoundingClientRect();
                 if (rect.width > 0 && rect.height > 0 && !el.disabled) {
+                    target = el;
                     var attrs = ['wire\\\\:click', 'wire\\\\:click\\\\.prevent', 'wire\\\\:click\\\\.stop'];
                     for (var a = 0; a < attrs.length; a++) {
                         var attr = el.getAttribute(attrs[a]);
-                        if (attr) { wireAttr = attrs[a] + '=' + attr; target = el; break; }
+                        if (attr) { wireAttr = attrs[a] + '=' + attr; break; }
                     }
-                    if (!target) {
-                        var parent = el.closest('[wire\\\\:click]') || el.closest('[wire\\\\:click\\\\.prevent]');
-                        if (parent) {
-                            var wc = parent.getAttribute('wire\\\\:click') || parent.getAttribute('wire\\\\:click\\\\.prevent');
-                            wireAttr = 'parent_wire:click=' + wc; target = parent;
-                        }
-                    }
-                    if (!target) { target = el; wireAttr = 'no_wire_attr'; }
+                    if (!wireAttr) wireAttr = 'no_wire_attr';
                     break;
                 }
             }
@@ -197,12 +192,6 @@ _LW_CLICK_JS = """
         target.dispatchEvent(new MouseEvent('mousedown', opts));
         target.dispatchEvent(new MouseEvent('mouseup', opts));
         target.dispatchEvent(new MouseEvent('click', opts));
-        var children = target.querySelectorAll('*');
-        for (var k = 0; k < children.length && k < 5; k++) {
-            children[k].dispatchEvent(new MouseEvent('mousedown', opts));
-            children[k].dispatchEvent(new MouseEvent('mouseup', opts));
-            children[k].dispatchEvent(new MouseEvent('click', opts));
-        }
         return 'clicked:' + target.tagName + ':wire=' + wireAttr;
     } catch(e) { return 'error:' + e.message; }
 })();

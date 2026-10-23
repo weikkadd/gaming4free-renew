@@ -201,7 +201,12 @@ def livewire_extend(sb) -> dict:
     except Exception as e:
         log.warning(f"按钮点击失败: {e}")
     
-    return {"results": results, "success": any("success" in r.lower() or "clicked" in r.lower() or "call_extend" in r.lower() for r in results)}
+    # 只认真正的 Livewire extend 调用（call_extend/direct_extend/emit_extend），
+    # 不认按钮点击结果——_LW_CLICK_JS 可能点中非续期元素（如 <html>）造成假成功
+    return {"results": results, "success": any(
+        ("call_extend" in r.lower() or "direct_extend" in r.lower() or "emit_extend" in r.lower())
+        for r in results
+    )}
 
 
 def click_renew_button(sb) -> bool:
@@ -615,20 +620,22 @@ def run():
                 log.info(f"已接近 {MAX_HOURS}h 上限，停止续期")
                 break
 
-            # Step 4.1: 先尝试 Livewire 方法，失败再试按钮点击
-            log.info("尝试 Livewire extend...")
-            lw_result = livewire_extend(sb)
-            if lw_result["success"]:
-                log.info("✅ Livewire extend 成功")
+            # Step 4.1: 站点真实续期机制=投票 +30min，优先走 click_renew_button；
+            # 仅在其失败时才退回 Livewire extend（避免旧 Livewire 逻辑假成功跳过硬续期）
+            log.info("尝试点击续期按钮（投票 +30min）...")
+            if click_renew_button(sb):
+                log.info("✅ 按钮点击续期已触发")
             else:
-                log.warning("Livewire extend 失败，尝试按钮点击...")
-                if not click_renew_button(sb):
+                log.warning("按钮点击失败，尝试 Livewire extend...")
+                lw_result = livewire_extend(sb)
+                if not lw_result["success"]:
                     screenshot(sb, f"no_btn_{click_count}")
-                    log.warning("本次未找到按钮，可能需要刷新页面")
+                    log.warning("本次未找到续期按钮，刷新页面重试")
                     sb.refresh()
                     sb.sleep(3)
                     last_sec = get_remaining_seconds(sb)
                     continue
+                log.info("✅ Livewire extend 成功")
 
             # Step 4.2: 处理可能出现的 Turnstile
             human_sleep(1.0, 2.0)
