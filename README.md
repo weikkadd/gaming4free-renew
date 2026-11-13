@@ -38,11 +38,11 @@ xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python renew.py
 
 ## 工作原理
 
-1. CDP 方式注入 Cookie (绕过页面超时)
+1. 注入 Cookie 后重新加载页面建立会话，并校验登录态
 2. SeleniumBase UC mode 启动 Chrome
-3. 三层续期策略: wire:id 精确调用 -> 通用组件遍历 -> JS 原生 click
-4. 广告监测 + 模拟真人活跃
-5. 刷新页面比对剩余时间验证
+3. 点击 console 页 "+ 90 min" 免费续期按钮（不碰 "+24h" 付费按钮）
+4. 若出现 Turnstile 弹窗则等待自动通过后提交
+5. 刷新页面比对剩余时间验证，失败自动截图 + dump HTML
 
 ## License
 

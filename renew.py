@@ -40,7 +40,7 @@ else:
     PROXY_URL = "socks5://127.0.0.1:1080"
 
 MAX_HOURS      = 48            # 续期上限 48 小时
-ADD_MINUTES    = 30            # 每次投票 +30 分钟
+ADD_MINUTES    = 90            # 每次续期 +90 分钟（console 页 "+ 90 min" 按钮）
 COOLDOWN_SEC   = 240           # 冷却 4 分钟
 MAX_CLICKS     = 80            # 单次运行最大投票次数
 PAGE_TIMEOUT   = 60            # 单页操作超时
@@ -133,6 +133,57 @@ def screenshot(sb, name: str):
     return p
 
 
+def fmt_hm(sec) -> str:
+    """把秒数格式化为 'Xh Ym'，无法识别时返回 '未知'"""
+    if sec is None or sec < 0:
+        return "未知"
+    return f"{sec // 3600}h {(sec % 3600) // 60}m"
+
+
+def dump_html(sb, name: str):
+    """保存当前页面 HTML，便于排查选择器失效/未登录等问题"""
+    try:
+        p = SHOT_DIR / f"{name}.html"
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(sb.get_page_source())
+        log.info(f"页面 HTML 已保存: {p}")
+    except Exception as e:
+        log.warning(f"保存页面 HTML 失败: {e}")
+
+
+def page_state(sb) -> dict:
+    """收集当前页面关键特征，用于判断是否已登录/按钮是否存在"""
+    try:
+        raw = sb.execute_script("""
+        (function(){
+            var out = {};
+            out.url = location.href;
+            out.title = document.title || '';
+            var pwd = document.querySelector('input[type=password]');
+            out.has_password = !!(pwd && pwd.getBoundingClientRect().width > 0);
+            out.has_login_link = !!document.querySelector('a[href*="login" i]');
+            out.btn_90min = false;
+            var clickable = document.querySelectorAll('button, a, [role=button], [wire\\\\:click]');
+            for (var i = 0; i < clickable.length; i++) {
+                var t = (clickable[i].innerText || '').trim();
+                if (/(?:\\+\\s*)?90\\s*min/i.test(t) && !/[$￥¥€]/.test(t) && !/24\\s*h/i.test(t)) {
+                    out.btn_90min = true; break;
+                }
+            }
+            out.vm_submit = !!document.querySelector('.vm-submit');
+            out.wire_count = document.querySelectorAll('[wire\\\\:id]').length;
+            out.turnstile = !!document.querySelector('.cf-turnstile');
+            var body = (document.body && document.body.innerText) || '';
+            out.body_head = body.replace(/\\s+/g, ' ').trim().substring(0, 300);
+            return JSON.stringify(out);
+        })();
+        """)
+        return json.loads(raw) if raw else {}
+    except Exception as e:
+        log.warning(f"page_state 获取失败: {e}")
+        return {}
+
+
 # ---------------------------------------------------------------------------
 # 续期核心
 # ---------------------------------------------------------------------------
@@ -155,8 +206,20 @@ def get_remaining_seconds(sb) -> int:
             except Exception:
                 continue
 
-        # 兜底：整页文本提取
-        body_text = sb.get_text("body")
+        # 兜底：整页文本提取（优先 HH:MM:SS 倒计时，如 "11:39:35 remaining"）
+        try:
+            body_text = sb.get_text("body") or ""
+        except Exception:
+            body_text = ""
+        best = -1
+        for mm in re.findall(r"\b(\d{1,2}:\d{2}:\d{2})\b", body_text):
+            p = mm.split(":")
+            val = int(p[0]) * 3600 + int(p[1]) * 60 + int(p[2])
+            if best < val < MAX_HOURS * 3600 + 3600:
+                best = val
+        if best > 0:
+            log.info(f"剩余时间 [body HH:MM:SS] -> {best}s ({fmt_hm(best)})")
+            return best
         for line in body_text.split("\n"):
             sec = parse_remaining_seconds(line)
             if 60 < sec < MAX_HOURS * 3600 + 3600:
@@ -209,60 +272,9 @@ def livewire_extend(sb) -> dict:
     )}
 
 
-def click_renew_button(sb) -> bool:
-    """gaming4free 续期：点 VOTE + ADD 30 MIN 弹窗 → 点 VOTE — ADDS 30 MINUTES 提交"""
+def try_render_turnstile(sb):
+    """Turnstile 长时间未自动通过时：诊断并尝试手动渲染 widget"""
     try:
-        vote_btn = sb.execute_script("""
-        (function(){
-        var el = document.querySelector('.sp-vote-btn');
-        if (!el) return 'not_found';
-        if (el.disabled) return 'disabled';
-        var r = el.getBoundingClientRect();
-        if (r.width === 0 || r.height === 0) return 'hidden';
-        el.scrollIntoView({block: 'center'});
-        el.click();
-        return 'clicked:' + el.innerText.trim();
-        })();
-        """)
-        if not vote_btn or not str(vote_btn).startswith("clicked:"):
-            log.warning(f"VOTE 按钮未找到: {vote_btn}")
-            return False
-        log.info(f"✅ 点击 VOTE 按钮: {vote_btn}")
-    except Exception as e:
-        log.warning(f"点击 VOTE 按钮失败: {e}")
-        return False
-
-    time.sleep(5)
-
-    try:
-        submit_btn = sb.execute_script("""
-        (function(){
-        var el = document.querySelector('.vm-submit');
-        if (!el) return 'not_found';
-        if (el.disabled) return 'disabled';
-        var r = el.getBoundingClientRect();
-        if (r.width === 0 || r.height === 0) return 'hidden';
-        el.scrollIntoView({block: 'center'});
-        el.click();
-        return 'clicked:' + el.innerText.trim();
-        })();
-        """)
-        if submit_btn and str(submit_btn).startswith("clicked:"):
-            log.info(f"✅ 点击 VOTE 提交: {submit_btn}")
-            return True
-
-        log.warning(f"VOTE 提交按钮状态: {submit_btn}，尝试处理验证码...")
-
-        captcha_html = sb.execute_script("""
-        (function(){
-        var c = document.querySelector('.vm-captcha');
-        if (!c) return 'no_captcha_element';
-        return c.outerHTML.substring(0, 2000);
-        })();
-        """)
-        if captcha_html:
-            log.info("=== vm-captcha HTML ===\n" + str(captcha_html) + "\n=== 结束 ===")
-
         ts_diag = sb.execute_script("""
         (function(){
         var out = [];
@@ -356,66 +368,128 @@ def click_renew_button(sb) -> bool:
             log.info(f"Turnstile render 后 response: {ts_resp}")
         else:
             log.warning("未找到 Turnstile sitekey，dump 页面 HTML")
-            try:
-                html = sb.get_page_source()
-                with open("debug_output/page.html", "w", encoding="utf-8") as f:
-                    f.write(html)
-                log.info("页面 HTML 已保存到 debug_output/page.html")
-            except Exception as e:
-                log.warning(f"保存 HTML 失败: {e}")
+            dump_html(sb, "no_sitekey")
+    except Exception as e:
+        log.warning(f"Turnstile 手动渲染失败: {e}")
 
-        sb.execute_script("""
+
+def click_renew_button(sb) -> bool:
+    """gaming4free 续期：点击 console 页 '+ 90 min' 免费按钮（'+24h $x' 付费按钮不碰）"""
+    try:
+        result = sb.execute_script("""
         (function(){
-        var c = document.querySelector('.vm-captcha');
-        if (c) {
-            c.click();
-            var children = c.querySelectorAll('*');
-            for (var i = 0; i < children.length && i < 10; i++) {
-                try { children[i].click(); } catch(e) {}
-            }
+        var candidates = document.querySelectorAll('button, a, [role=button], [wire\\\\:click], [wire\\\\:click\\\\.prevent]');
+        for (var i = 0; i < candidates.length; i++) {
+            var el = candidates[i];
+            var t = (el.innerText || el.textContent || '').trim();
+            if (!t || t.length > 60) continue;
+            if (!/(?:\\+\\s*)?90\\s*min/i.test(t)) continue;
+            if (/[$￥¥€]/.test(t) || /24\\s*h/i.test(t)) continue;
+            if (el.disabled) return 'disabled';
+            var r = el.getBoundingClientRect();
+            if (r.width === 0 || r.height === 0) return 'hidden';
+            el.scrollIntoView({block: 'center'});
+            el.click();
+            return 'clicked:' + t.substring(0, 40);
         }
+        return 'not_found';
         })();
         """)
-        time.sleep(3)
+        if not result or not str(result).startswith("clicked:"):
+            log.warning(f"+90min 续期按钮未找到: {result}")
+            return False
+        log.info(f"✅ 点击续期按钮: {result}")
+    except Exception as e:
+        log.warning(f"点击续期按钮异常: {e}")
+        return False
 
-        sb.execute_script("""
+    time.sleep(4)
+
+    # 点击后：若出现确认弹窗/Turnstile 则等待通过并提交；无弹窗则视为点击即续期
+    no_modal_rounds = 0
+    token_ok_rounds = 0
+    ts_rendered = False
+    for wait_round in range(24):                       # 最多约 60s
+        try:
+            state = str(sb.execute_script("""
         (function(){
-        var btns = document.querySelectorAll('button, a, [role=button], div');
-        for (var i = 0; i < btns.length; i++) {
-            var t = (btns[i].innerText||'').trim().toLowerCase();
-            if (t.indexOf('enable ads') !== -1) {
-                var r = btns[i].getBoundingClientRect();
-                if (r.width > 0 && r.height > 0 && !btns[i].disabled) {
-                    btns[i].click();
-                    return;
+        function visible(el){ var r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; }
+        var nodes = document.querySelectorAll('.vm-captcha, .cf-turnstile, [role=dialog], .modal.show, .modal[style*="block"], .popup');
+        var modal = null;
+        for (var k = 0; k < nodes.length; k++) { if (visible(nodes[k])) { modal = nodes[k]; break; } }
+        var tsIframe = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
+        if (!modal && !tsIframe) return 'no_modal';
+
+        if (!window.__enaClicked) {
+            var all = document.querySelectorAll('button, a, [role=button]');
+            for (var i = 0; i < all.length; i++) {
+                var t = (all[i].innerText || '').trim().toLowerCase();
+                if (t.indexOf('enable ads') !== -1 && !all[i].disabled && visible(all[i])) {
+                    window.__enaClicked = true;
+                    all[i].click();
+                    return 'clicked:enable_ads';
                 }
             }
         }
+
+        var resp = document.querySelector('[name="cf-turnstile-response"]') || document.querySelector('input[name*="turnstile"]');
+        var tokenOk = !!(resp && resp.value && resp.value.length > 20);
+
+        var s = document.querySelector('.vm-submit');
+        if (s && !s.disabled && visible(s)) {
+            s.scrollIntoView({block: 'center'});
+            s.click();
+            return 'clicked:vm-submit';
+        }
+        if (modal) {
+            var mbtns = modal.querySelectorAll('button, [role=button]');
+            for (var j = 0; j < mbtns.length; j++) {
+                var b = mbtns[j], bt = (b.innerText || '').trim();
+                if (/confirm|submit|continue|vote|claim|extend|get\\s*\\d/i.test(bt) && !/[$￥¥]/.test(bt) && !b.disabled && visible(b)) {
+                    b.scrollIntoView({block: 'center'});
+                    b.click();
+                    return 'clicked:modal:' + bt.substring(0, 30);
+                }
+            }
+        }
+        return 'waiting:' + (tokenOk ? 'token_ok' : 'token_missing');
         })();
-        """)
-        time.sleep(5)
+        """))
+        except Exception as e:
+            log.warning(f"弹窗检测异常: {e}")
+            state = 'no_modal'
 
-        for wait_round in range(6):
-            submit_btn = sb.execute_script("""
-            (function(){
-            var el = document.querySelector('.vm-submit');
-            if (!el) return 'not_found';
-            if (el.disabled) return 'disabled';
-            el.click();
-            return 'clicked:' + el.innerText.trim();
-            })();
-            """)
-            if submit_btn and str(submit_btn).startswith("clicked:"):
-                log.info(f"✅ 验证码通过，点击 VOTE 提交: {submit_btn}")
+        if state.startswith("clicked:enable_ads"):
+            log.info("已点击 enable ads，继续等待确认...")
+        elif state.startswith("clicked:"):
+            log.info(f"✅ 续期确认: {state}")
+            return True
+        elif state == "no_modal":
+            no_modal_rounds += 1
+            token_ok_rounds = 0
+            if no_modal_rounds >= 3:
+                log.info("无确认弹窗，点击即完成续期")
                 return True
-            log.info(f"等待验证码通过... ({wait_round+1}/6) submit={submit_btn}")
-            time.sleep(5)
+        elif state == "waiting:token_ok":
+            token_ok_rounds += 1
+            no_modal_rounds = 0
+            if token_ok_rounds >= 2:
+                log.info("Turnstile 已通过，等待自动提交")
+                return True
+        else:
+            no_modal_rounds = 0
+            token_ok_rounds = 0
+            if wait_round % 4 == 0:
+                log.info(f"等待验证码/弹窗... ({state}, {wait_round+1}/24)")
+            # Turnstile 长时间未出 token：诊断 + 尝试手动渲染（每次点击只试一次）
+            if not ts_rendered and state == "waiting:token_missing" and wait_round >= 8:
+                ts_rendered = True
+                try_render_turnstile(sb)
+        time.sleep(2.5)
 
-        screenshot(sb, "vote_modal_fail")
-        return False
-    except Exception as e:
-        log.warning(f"点击 VOTE 提交失败: {e}")
-        return False
+    screenshot(sb, "renew_no_confirm")
+    log.warning("点击 +90min 后 60s 内未完成确认流程")
+    return False
 
 
 def handle_turnstile(sb) -> bool:
@@ -476,15 +550,20 @@ def handle_turnstile(sb) -> bool:
 def inject_cookies(sb):
     """如果提供了 cookie 字符串，注入到当前域名"""
     if not COOKIE_STR:
+        log.info("未配置 cookie，跳过注入")
         return
-    log.info("注入自定义 cookie ...")
-    for item in COOKIE_STR.split(";"):
-        if "=" in item:
-            k, v = item.strip().split("=", 1)
-            try:
-                sb.set_cookie(k, v)
-            except Exception:
-                pass
+    pairs = [item.strip() for item in COOKIE_STR.split(";") if "=" in item]
+    log.info(f"注入自定义 cookie ... (共 {len(pairs)} 条)")
+    ok, fail = 0, 0
+    for item in pairs:
+        k, v = item.split("=", 1)
+        try:
+            sb.set_cookie(k.strip(), v.strip())
+            ok += 1
+        except Exception as e:
+            fail += 1
+            log.warning(f"  cookie {k.strip()[:40]} 注入失败: {str(e)[:80]}")
+    log.info(f"cookie 注入完成: 成功 {ok}, 失败 {fail}")
 
 
 def do_login(sb):
@@ -604,15 +683,45 @@ def run():
             sb.open(LOGIN_URL)
             sb.sleep(2)
             do_login(sb)
-            sb.open(SITE_URL)
-            sb.sleep(2)
+
+        # 关键：注入 cookie 后必须重新导航一次，浏览器才会带上 cookie 建立会话；
+        # 不刷新的话当前渲染的仍是未登录页面（按钮一直 not_found 的根因）
+        sb.open(SITE_URL)
+        sb.sleep(2)
+
+        # 若重新导航后落在 CF 盾上，继续等待
+        for _ in range(20):
+            try:
+                page_txt = (sb.get_page_title() or "") + " " + sb.get_text("body")
+            except Exception:
+                page_txt = ""
+            low = page_txt.lower()
+            if "just a moment" in low or "attention required" in low:
+                time.sleep(1)
+            else:
+                break
 
         screenshot(sb, "dashboard")
 
+        # Step 3.5: 登录态校验 —— cookie 失效时明确报错退出，不做无意义循环
+        st = page_state(sb)
+        log.info(f"页面状态: {json.dumps(st, ensure_ascii=False)}")
+        if st.get("has_password") and st.get("wire_count", 0) == 0 and not st.get("btn_90min"):
+            dump_html(sb, "not_logged_in")
+            screenshot(sb, "not_logged_in")
+            log.error("页面仍显示登录表单：cookie 已失效或未注入成功，请更新 GAME4FREE_COOKIE")
+            tg("❌ gaming4free 续期失败：页面显示登录表单，cookie 已失效/未生效")
+            return
+
         # Step 4: 主循环 - 反复点击续期直到接近 48h
         click_count = 0
+        no_btn_streak = 0          # 连续找不到续期入口的次数
         last_sec = get_remaining_seconds(sb)
-        log.info(f"初始剩余: {last_sec}s ({last_sec//3600}h {(last_sec%3600)//60}m)")
+        log.info(f"初始剩余: {last_sec}s ({fmt_hm(last_sec)})")
+
+        if last_sec < 0 and not st.get("btn_90min"):
+            log.warning("未检测到剩余时间倒计时，且页面上没有续期按钮 —— "
+                        "请确认 GAME4FREE_RENEW_URL 指向服务器详情页 (/server/{id}) 而非首页")
 
         while click_count < MAX_CLICKS:
             # 接近上限就停
@@ -620,22 +729,41 @@ def run():
                 log.info(f"已接近 {MAX_HOURS}h 上限，停止续期")
                 break
 
-            # Step 4.1: 站点真实续期机制=投票 +30min，优先走 click_renew_button；
+            # Step 4.1: 站点真实续期机制 = console 页 "+ 90 min" 免费按钮，优先走 click_renew_button；
             # 仅在其失败时才退回 Livewire extend（避免旧 Livewire 逻辑假成功跳过硬续期）
-            log.info("尝试点击续期按钮（投票 +30min）...")
+            log.info("尝试点击续期按钮（+90 min）...")
             if click_renew_button(sb):
                 log.info("✅ 按钮点击续期已触发")
+                no_btn_streak = 0
             else:
                 log.warning("按钮点击失败，尝试 Livewire extend...")
                 lw_result = livewire_extend(sb)
                 if not lw_result["success"]:
+                    no_btn_streak += 1
                     screenshot(sb, f"no_btn_{click_count}")
-                    log.warning("本次未找到续期按钮，刷新页面重试")
+                    if no_btn_streak == 1:
+                        dump_html(sb, f"no_btn_page_{click_count}")
+                        st2 = page_state(sb)
+                        log.warning(f"页面状态: {json.dumps(st2, ensure_ascii=False)}")
+                    log.warning(f"本次未找到续期入口（连续 {no_btn_streak}/5），刷新页面重试")
+                    if no_btn_streak >= 5:
+                        dump_html(sb, "abort_page")
+                        st3 = page_state(sb)
+                        if st3.get("has_password") and st3.get("wire_count", 0) == 0:
+                            hint = "页面显示登录表单，cookie 很可能已失效"
+                        elif st3.get("wire_count", 0) == 0:
+                            hint = "页面无 Livewire 组件：请确认 URL 指向 /server/{id} 详情页，或站点已改版"
+                        else:
+                            hint = "有 Livewire 组件但找不到续期按钮：站点选择器可能已改版，请查看 abort_page.html"
+                        log.error(f"连续 5 次未找到续期入口，终止本轮。原因猜测: {hint}")
+                        tg(f"❌ gaming4free 续期失败：连续 5 次未找到续期入口\n原因: {hint}")
+                        return
                     sb.refresh()
                     sb.sleep(3)
                     last_sec = get_remaining_seconds(sb)
                     continue
                 log.info("✅ Livewire extend 成功")
+                no_btn_streak = 0
 
             # Step 4.2: 处理可能出现的 Turnstile
             human_sleep(1.0, 2.0)
@@ -673,10 +801,9 @@ def run():
 
         # 收尾
         final_sec = get_remaining_seconds(sb)
-        h, m = final_sec // 3600, (final_sec % 3600) // 60
         msg = (f"gaming4free 续期完成\n"
                f"成功点击: {click_count} 次\n"
-               f"最终剩余: {h}h {m}m")
+               f"最终剩余: {fmt_hm(final_sec)}")
         log.info(msg)
         tg(msg)
         screenshot(sb, "final")
