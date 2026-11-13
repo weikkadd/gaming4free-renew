@@ -557,12 +557,14 @@ def inject_cookies(sb):
     ok, fail = 0, 0
     for item in pairs:
         k, v = item.split("=", 1)
+        k, v = k.strip(), v.strip()
         try:
-            sb.set_cookie(k.strip(), v.strip())
+            # SeleniumBase BaseCase 没有 set_cookie 方法，直接用底层 webdriver 注入
+            sb.driver.add_cookie({"name": k, "value": v})
             ok += 1
         except Exception as e:
             fail += 1
-            log.warning(f"  cookie {k.strip()[:40]} 注入失败: {str(e)[:80]}")
+            log.warning(f"  cookie {k[:40]} 注入失败: {str(e)[:80]}")
     log.info(f"cookie 注入完成: 成功 {ok}, 失败 {fail}")
 
 
@@ -704,13 +706,16 @@ def run():
         screenshot(sb, "dashboard")
 
         # Step 3.5: 登录态校验 —— cookie 失效时明确报错退出，不做无意义循环
+        # （本站是无密码登录：Discord/Google 一键，登录页没有密码输入框，
+        #   所以被重定向到 /login URL 才是最可靠的未登录信号）
         st = page_state(sb)
         log.info(f"页面状态: {json.dumps(st, ensure_ascii=False)}")
-        if st.get("has_password") and st.get("wire_count", 0) == 0 and not st.get("btn_90min"):
+        on_login_page = "/login" in st.get("url", "")
+        if on_login_page or (st.get("has_password") and st.get("wire_count", 0) == 0):
             dump_html(sb, "not_logged_in")
             screenshot(sb, "not_logged_in")
-            log.error("页面仍显示登录表单：cookie 已失效或未注入成功，请更新 GAME4FREE_COOKIE")
-            tg("❌ gaming4free 续期失败：页面显示登录表单，cookie 已失效/未生效")
+            log.error("未登录（被重定向到登录页）：cookie 注入失败或已失效，请更新 GAME4FREE_COOKIE")
+            tg(f"❌ gaming4free 续期失败：未登录\n当前页面: {st.get('url', '?')}")
             return
 
         # Step 4: 主循环 - 反复点击续期直到接近 48h
@@ -749,7 +754,9 @@ def run():
                     if no_btn_streak >= 5:
                         dump_html(sb, "abort_page")
                         st3 = page_state(sb)
-                        if st3.get("has_password") and st3.get("wire_count", 0) == 0:
+                        if "/login" in st3.get("url", ""):
+                            hint = "被重定向到登录页：cookie 注入失败或已失效"
+                        elif st3.get("has_password") and st3.get("wire_count", 0) == 0:
                             hint = "页面显示登录表单，cookie 很可能已失效"
                         elif st3.get("wire_count", 0) == 0:
                             hint = "页面无 Livewire 组件：请确认 URL 指向 /server/{id} 详情页，或站点已改版"
