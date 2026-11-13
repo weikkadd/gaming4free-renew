@@ -373,8 +373,111 @@ def try_render_turnstile(sb):
         log.warning(f"Turnstile 手动渲染失败: {e}")
 
 
+# 安装在页面里的 Livewire 请求捕获 hook（幂等；页面刷新后重装即可）
+_LW_HOOK_JS = """
+(function(){
+    if (window.__lwHookInstalled) return 'already';
+    window.__lwHookInstalled = true;
+    window.__lwResponses = [];
+    try {
+        var origFetch = window.fetch;
+        window.fetch = function() {
+            var args = arguments, url = (typeof args[0] === 'string') ? args[0] : ((args[0] && args[0].url) || '');
+            var isLw = String(url).indexOf('livewire') !== -1;
+            if (!isLw && args[1] && args[1].headers) {
+                try {
+                    var h = args[1].headers;
+                    if (h.get && h.get('X-Livewire')) isLw = true;
+                    else if (h['X-Livewire'] || h['x-livewire']) isLw = true;
+                } catch(e) {}
+            }
+            var p = origFetch.apply(this, args);
+            if (isLw) {
+                p.then(function(res){
+                    try {
+                        res.clone().text().then(function(t){
+                            window.__lwResponses.push({type:'fetch', url:String(url).substring(0,120), status:res.status, body:t.substring(0,3000)});
+                        });
+                    } catch(e) {}
+                }).catch(function(){});
+            }
+            return p;
+        };
+        var origOpen = XMLHttpRequest.prototype.open;
+        var origSend = XMLHttpRequest.prototype.send;
+        XMLHttpRequest.prototype.open = function(m, u) { this.__lwUrl = u; return origOpen.apply(this, arguments); };
+        XMLHttpRequest.prototype.send = function() {
+            var xhr = this;
+            if (String(xhr.__lwUrl || '').indexOf('livewire') !== -1) {
+                xhr.addEventListener('load', function(){
+                    try { window.__lwResponses.push({type:'xhr', url:String(xhr.__lwUrl).substring(0,120), status:xhr.status, body:String(xhr.responseText||'').substring(0,3000)}); } catch(e) {}
+                });
+            }
+            return origSend.apply(this, arguments);
+        };
+        return 'installed';
+    } catch(e) { return 'error:' + e.message; }
+})();
+"""
+
+
+def capture_renew_response(sb):
+    """续期点击未生效时：抓取浏览器对话框/新标签页/页面提示/Livewire 响应，定位真实原因"""
+    # 1) 未处理的 alert/confirm 对话框
+    try:
+        alert = sb.driver.switch_to.alert
+        log.warning(f"存在浏览器对话框: {alert.text}")
+        alert.accept()
+    except Exception:
+        pass
+
+    # 2) 新标签页（投票/广告流可能在新的标签页打开）
+    try:
+        handles = sb.driver.window_handles
+        if len(handles) > 1:
+            for h in handles[1:]:
+                sb.driver.switch_to.window(h)
+                log.warning(f"点击后打开了新标签页: url={sb.driver.current_url} title={sb.driver.title}")
+                screenshot(sb, "new_tab")
+            sb.driver.switch_to.window(handles[0])
+    except Exception as e:
+        log.warning(f"标签页检查失败: {e}")
+
+    # 3) 页面 toast / 提示条
+    try:
+        toasts = sb.execute_script("""
+        (function(){
+            var sels = '[role=alert], .toast, .Toast, .alert, .notification, .snackbar, .swal2-container, .Toastify, .modal-content';
+            var out = [];
+            var nodes = document.querySelectorAll(sels);
+            for (var i = 0; i < nodes.length && i < 10; i++) {
+                var t = (nodes[i].innerText || '').trim();
+                if (t && nodes[i].getBoundingClientRect().width > 0) out.push(t.substring(0, 200));
+            }
+            return out.join(' || ');
+        })();
+        """)
+        if toasts:
+            log.warning(f"页面提示: {toasts}")
+    except Exception:
+        pass
+
+    # 4) Livewire 请求的真实响应（点击前已安装 hook）
+    try:
+        responses = sb.execute_script("return JSON.stringify((window.__lwResponses || []).slice(0, 3))")
+        if responses and responses != "[]":
+            log.warning(f"Livewire 响应捕获: {str(responses)[:1500]}")
+    except Exception:
+        pass
+
+
 def click_renew_button(sb) -> bool:
     """gaming4free 续期：点击 console 页 '+ 90 min' 免费按钮（'+24h $x' 付费按钮不碰）"""
+    # 安装 Livewire 请求捕获 hook（失败不影响点击）
+    try:
+        sb.execute_script(_LW_HOOK_JS)
+    except Exception:
+        pass
     try:
         result = sb.execute_script("""
         (function(){
@@ -390,7 +493,8 @@ def click_renew_button(sb) -> bool:
             if (r.width === 0 || r.height === 0) return 'hidden';
             el.scrollIntoView({block: 'center'});
             el.click();
-            return 'clicked:' + t.substring(0, 40);
+            var wireAttr = el.getAttribute('wire:click') || el.getAttribute('wire:click.prevent') || 'none';
+            return 'clicked:' + t.substring(0, 40) + '|tag=' + el.tagName + '|wire=' + wireAttr;
         }
         return 'not_found';
         })();
@@ -793,6 +897,7 @@ def run():
             else:
                 log.warning("续期可能失败，时间未增加")
                 screenshot(sb, f"fail_{click_count}")
+                capture_renew_response(sb)
                 sb.refresh()
                 sb.sleep(3)
                 last_sec = get_remaining_seconds(sb)
