@@ -391,6 +391,34 @@ _LW_HOOK_JS = """
     if (window.__lwHookInstalled) return 'already';
     window.__lwHookInstalled = true;
     window.__lwResponses = [];
+    window.__popups = [];
+    window.__postMessages = [];
+    // window.open 捕获：合成点击无 user activation 时，弹窗广告会被 Chrome 拦截
+    try {
+        var origOpen = window.open;
+        window.open = function(u, n, f) {
+            var ret = null;
+            try { ret = origOpen.apply(this, arguments); } catch(e) {
+                window.__popups.push({url: String(u || '').substring(0, 200), blocked: true, err: String(e).substring(0, 80), time: Date.now()});
+                return null;
+            }
+            window.__popups.push({url: String(u || '').substring(0, 200), blocked: !ret, time: Date.now()});
+            return ret;
+        };
+    } catch(e) {}
+    // postMessage 捕获（广告完成回调通常 postMessage 通知父页）
+    try {
+        window.addEventListener('message', function(ev) {
+            try {
+                window.__postMessages.push({
+                    origin: String(ev.origin || '').substring(0, 80),
+                    data: String(typeof ev.data === 'object' ? JSON.stringify(ev.data) : ev.data).substring(0, 300),
+                    time: Date.now()
+                });
+                if (window.__postMessages.length > 20) window.__postMessages.shift();
+            } catch(e) {}
+        });
+    } catch(e) {}
     try {
         var origFetch = window.fetch;
         window.fetch = function() {
@@ -434,28 +462,37 @@ _LW_HOOK_JS = """
 
 
 def capture_renew_response(sb):
-    """续期点击未生效时：抓取浏览器对话框/新标签页/页面提示/Livewire 响应，定位真实原因"""
-    # 1) 未处理的 alert/confirm 对话框
+    """续期点击未生效时：抓取页面上下文证据（弹窗/回调/提示/Livewire 响应）定位真实原因。
+    注意：UC 模式下 sb.* API（走 CDP 通道）可靠，原生 sb.driver.* 可能 connection refused，
+    所以页面内诊断放最前，原生 driver 调用放最后且失败不影响其余步骤。"""
+    # 1) window.open 弹窗记录 + postMessage 回调 + 广告 SDK 状态（页面上下文，最可靠）
     try:
-        alert = sb.driver.switch_to.alert
-        log.warning(f"存在浏览器对话框: {alert.text}")
-        alert.accept()
-    except Exception:
-        pass
-
-    # 2) 新标签页（投票/广告流可能在新的标签页打开）
-    try:
-        handles = sb.driver.window_handles
-        if len(handles) > 1:
-            for h in handles[1:]:
-                sb.driver.switch_to.window(h)
-                log.warning(f"点击后打开了新标签页: url={sb.driver.current_url} title={sb.driver.title}")
-                screenshot(sb, "new_tab")
-            sb.driver.switch_to.window(handles[0])
+        diag = sb.execute_script("""
+        (function(){
+            var out = {};
+            out.popups = (window.__popups || []).slice(-5);
+            out.postMessages = (window.__postMessages || []).slice(-8);
+            out.sdk = {
+                ramp: typeof window.ramp !== 'undefined',
+                vidazoo: typeof window.vidazoo !== 'undefined',
+                pw: typeof window.pw !== 'undefined'
+            };
+            var adScripts = [];
+            var scripts = document.querySelectorAll('script[src]');
+            for (var i = 0; i < scripts.length; i++) {
+                var s = scripts[i].src || '';
+                if (/playwire|ramp|vidazoo|swapscape|reward/i.test(s)) adScripts.push(s.substring(0, 120));
+            }
+            out.adScripts = adScripts.slice(0, 6);
+            return JSON.stringify(out);
+        })();
+        """)
+        if diag:
+            log.warning(f"弹窗/回调/SDK 诊断: {str(diag)[:1200]}")
     except Exception as e:
-        log.warning(f"标签页检查失败: {e}")
+        log.warning(f"弹窗诊断失败: {e}")
 
-    # 3) 页面 toast / 提示条
+    # 2) 页面 toast / 提示条
     try:
         toasts = sb.execute_script("""
         (function(){
@@ -474,13 +511,33 @@ def capture_renew_response(sb):
     except Exception:
         pass
 
-    # 4) Livewire 请求的真实响应（点击前已安装 hook）
+    # 3) Livewire 请求的真实响应（点击前已安装 hook）
     try:
         responses = sb.execute_script("return JSON.stringify((window.__lwResponses || []).slice(0, 3))")
         if responses and responses != "[]":
             log.warning(f"Livewire 响应捕获: {str(responses)[:1500]}")
     except Exception:
         pass
+
+    # 4) 未处理的 alert/confirm 对话框（原生 driver 调用，可能失败）
+    try:
+        alert = sb.driver.switch_to.alert
+        log.warning(f"存在浏览器对话框: {alert.text}")
+        alert.accept()
+    except Exception:
+        pass
+
+    # 5) 新标签页检查（原生 driver 调用，失败不影响上面所有诊断）
+    try:
+        handles = sb.driver.window_handles
+        if len(handles) > 1:
+            for h in handles[1:]:
+                sb.driver.switch_to.window(h)
+                log.warning(f"点击后打开了新标签页: url={sb.driver.current_url} title={sb.driver.title}")
+                screenshot(sb, "new_tab")
+            sb.driver.switch_to.window(handles[0])
+    except Exception as e:
+        log.warning(f"标签页检查失败(driver 不可用时忽略): {str(e)[:120]}")
 
 
 def get_expires_ts(sb) -> int:
@@ -551,7 +608,11 @@ def click_renew_button(sb) -> bool:
         return False
     log.info(f"按钮就绪: {ready}")
 
-    # 3) 点击按钮
+    # 3) 标记按钮 + 受信任点击。
+    #    合成 el.click() 是不可信事件（无 user activation），站点 JS 在处理器里
+    #    调 window.open 打开 Playwire 激励广告弹窗时会被 Chrome 直接拦截——
+    #    这就是"点击后无广告无弹窗、expiresTimestamp 不变"的根因。
+    #    uc_click 走 CDP 真实鼠标事件，带 user activation，弹窗可正常打开。
     try:
         result = str(sb.execute_script("""
         (function(){
@@ -565,21 +626,63 @@ def click_renew_button(sb) -> bool:
             if (el.disabled) return 'disabled';
             var r = el.getBoundingClientRect();
             if (r.width === 0 || r.height === 0) return 'hidden';
-            el.scrollIntoView({block: 'center'});
-            el.click();
+            var olds = document.querySelectorAll('[data-g4f-renew]');
+            for (var k = 0; k < olds.length; k++) olds[k].removeAttribute('data-g4f-renew');
+            el.setAttribute('data-g4f-renew', '1');
             var wireAttr = el.getAttribute('wire:click') || el.getAttribute('wire:click.prevent') || 'none';
-            return 'clicked:' + t.substring(0, 40) + '|tag=' + el.tagName + '|wire=' + wireAttr;
+            return 'marked:' + t.substring(0, 40) + '|tag=' + el.tagName + '|wire=' + wireAttr;
         }
         return 'not_found';
         })();
         """))
-        if not result.startswith("clicked:"):
+        if not result.startswith("marked:"):
             log.warning(f"+90min 续期按钮未找到: {result}")
             return False
-        log.info(f"✅ 点击续期按钮: {result}")
+        log.info(f"已标记续期按钮: {result}")
     except Exception as e:
-        log.warning(f"点击续期按钮异常: {e}")
+        log.warning(f"标记续期按钮异常: {e}")
         return False
+
+    RENEW_SEL = '[data-g4f-renew="1"]'
+    clicked = False
+    try:
+        sb.uc_click(RENEW_SEL)
+        clicked = True
+        log.info("✅ uc_click 受信任点击完成（带 user activation，弹窗广告可打开）")
+    except Exception as e:
+        log.warning(f"uc_click 异常: {e}")
+        try:
+            sb.reconnect()
+        except Exception:
+            pass
+    if not clicked:
+        try:
+            pt_raw = sb.execute_script("""
+            (function(){
+            var el = document.querySelector('%s');
+            if (!el) return null;
+            el.scrollIntoView({block: 'center'});
+            var r = el.getBoundingClientRect();
+            return JSON.stringify({x: Math.round(r.left + r.width/2), y: Math.round(r.top + r.height/2)});
+            })();
+            """ % RENEW_SEL)
+            pt = json.loads(pt_raw) if pt_raw else None
+            if pt:
+                sb.driver.execute_cdp_cmd("Input.dispatchMouseEvent",
+                    {"type": "mousePressed", "x": pt["x"], "y": pt["y"], "button": "left", "clickCount": 1})
+                sb.driver.execute_cdp_cmd("Input.dispatchMouseEvent",
+                    {"type": "mouseReleased", "x": pt["x"], "y": pt["y"], "button": "left", "clickCount": 1})
+                clicked = True
+                log.info("✅ CDP 鼠标事件受信任点击完成")
+        except Exception as e:
+            log.warning(f"CDP 点击异常: {e}")
+    if not clicked:
+        try:
+            sb.execute_script("(function(){ var el = document.querySelector('%s'); if (el) el.click(); })();" % RENEW_SEL)
+            log.info("⚠️ 已退回合成 click（无 user activation，弹窗广告可能被拦截）")
+        except Exception as e:
+            log.warning(f"合成点击异常: {e}")
+            return False
 
     # 4) 点击后统一等待（最多约 90s）：广告播放 -> 播完点领取；或确认弹窗/Turnstile
     ad_seen = False
@@ -604,7 +707,15 @@ def click_renew_button(sb) -> bool:
         var modal = null;
         for (var k = 0; k < nodes.length; k++) { if (visible(nodes[k])) { modal = nodes[k]; break; } }
         var tsIframe = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
-        if (!modal && !tsIframe) return 'no_modal';
+        if (!modal && !tsIframe) {
+            // 弹窗广告动向（window.open hook 捕获，页面上下文不依赖 chromedriver）
+            var pops = window.__popups || [];
+            if (pops.length) {
+                var lastPop = pops[pops.length - 1];
+                return 'popup:' + (lastPop.blocked ? 'blocked' : 'opened') + ':' + lastPop.url.substring(0, 80);
+            }
+            return 'no_modal';
+        }
 
         if (!window.__enaClicked) {
             var all = document.querySelectorAll('button, a, [role=button]');
@@ -652,6 +763,16 @@ def click_renew_button(sb) -> bool:
             time.sleep(3)
             continue
 
+        if state.startswith("popup:"):
+            if ":blocked" in state:
+                log.error(f"广告弹窗被 Chrome 拦截（点击缺少 user activation）: {state[:120]}")
+                break
+            ad_seen = True
+            if wait_round % 5 == 0:
+                log.info(f"广告弹窗已打开，等待播放/回调... (~{wait_round*3}s)")
+            time.sleep(3)
+            continue
+
         if state.startswith("clicked:enable_ads"):
             log.info("已点击 enable ads，继续等待...")
         elif state.startswith("clicked:"):
@@ -689,6 +810,18 @@ def click_renew_button(sb) -> bool:
                 ts_rendered = True
                 try_render_turnstile(sb)
         time.sleep(3)
+
+    # 4.5) 弹窗若仍在打开，尽力关闭（激励奖励一般在弹窗关闭后结算到账）
+    try:
+        handles = sb.driver.window_handles
+        if handles and len(handles) > 1:
+            sb.driver.switch_to.window(handles[-1])
+            sb.driver.close()
+            sb.driver.switch_to.window(handles[0])
+            log.info("已关闭广告弹窗，等待服务端结算")
+            time.sleep(6)
+    except Exception as e:
+        log.warning(f"关闭弹窗失败(忽略): {str(e)[:100]}")
 
     # 5) 最终判定：服务端 expiresTimestamp 为真值；无广告无弹窗时兜底 wire 方法直调
     ts_after = get_expires_ts(sb)
