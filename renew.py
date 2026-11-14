@@ -513,9 +513,17 @@ def capture_renew_response(sb):
         diag = sb.execute_script("""
         (function(){
             var out = {};
-            var el = document.querySelector('[data-g4f-renew]');
-            out.btnHtml = el ? el.outerHTML.substring(0, 400) : 'no_marked_btn';
-            out.parentHtml = (el && el.parentElement) ? el.parentElement.outerHTML.substring(0, 700) : '';
+            var btn = null;
+            var candidates = document.querySelectorAll('button, a, [role=button]');
+            for (var i = 0; i < candidates.length; i++) {
+                var t = (candidates[i].innerText || '').trim();
+                if (/(?:\\+\\s*)?90\\s*min/i.test(t) && !/[$￥¥€]/.test(t) && !/24\\s*h/i.test(t)) { btn = candidates[i]; break; }
+            }
+            out.btnHtml = btn ? btn.outerHTML.substring(0, 500) : 'not_found';
+            var p1 = btn ? btn.parentElement : null;
+            var p2 = p1 ? p1.parentElement : null;
+            out.parentHtml = p1 ? p1.outerHTML.substring(0, 900) : '';
+            out.gpHtml = p2 ? p2.outerHTML.substring(0, 1500) : '';
             out.popups = (window.__popups || []).slice(-5);
             out.clicks = (window.__clicks || []).slice(-8);
             out.jsErrors = (window.__jsErrors || []).slice(-5);
@@ -551,7 +559,12 @@ def capture_renew_response(sb):
         })();
         """)
         if diag:
-            log.warning(f"页面上下文诊断: {str(diag)[:2500]}")
+            log.warning(f"页面上下文诊断: {str(diag)[:3500]}")
+            try:
+                with open(SHOT_DIR / "page_diag.json", "w", encoding="utf-8") as f:
+                    f.write(str(diag))
+            except Exception:
+                pass
     except Exception as e:
         log.warning(f"页面诊断失败: {e}")
 
@@ -605,11 +618,14 @@ def capture_renew_response(sb):
     # 6) Livewire 方法探测（每次运行只做一次）
     probe_livewire_methods(sb)
 
+    # 7) 站点 JS 源码扫描（每次运行只做一次，定位按钮处理器真实逻辑）
+    scan_page_js(sb)
+
 
 _PROBE_DONE = {"done": False}
 
 def probe_livewire_methods(sb):
-    """对 renewal-timer 组件逐个尝试候选续期方法名，找出服务端真实存在的方法。
+    """对 renewal-timer 组件逐个尝试候选续期方法（含带参变体），找出服务端真实存在的调用。
     调用不存在的方法 promise 会 reject（服务器报错）；存在则 resolve。
     仅在首轮续期失败后执行一次。"""
     if _PROBE_DONE["done"]:
@@ -630,25 +646,28 @@ def probe_livewire_methods(sb):
             }
             if (!comp) return 'component_not_found';
             window.__probeResults = [];
-            var methods = ['watchAd', 'startAd', 'claimAd', 'claimAdReward', 'rewardAd', 'adReward',
-                           'renew', 'extend', 'watchAdAndEarn', 'claimFreeMinutes'];
+            var calls = [
+                ['watchAd'], ['startAd'], ['claimAd'], ['claimAdReward'], ['rewardAd'], ['adReward'],
+                ['renew'], ['extend'], ['watchAdAndEarn'], ['claimFreeMinutes'],
+                ['extend', 90], ['extend', 5400], ['extend', '90'], ['claimAdReward', 90], ['rewardAd', 'completed']
+            ];
             var chain = Promise.resolve();
-            methods.forEach(function(m) {
+            calls.forEach(function(c) {
                 chain = chain.then(function() {
-                    return comp.$wire.call(m).then(function(resp) {
-                        window.__probeResults.push({m: m, ok: true, r: JSON.stringify(resp).substring(0, 250)});
+                    return comp.$wire.call.apply(comp.$wire, c).then(function(resp) {
+                        window.__probeResults.push({m: c.join(','), ok: true, r: JSON.stringify(resp).substring(0, 250)});
                     }).catch(function(err) {
-                        window.__probeResults.push({m: m, ok: false, e: String((err && err.message) || err).substring(0, 200)});
+                        window.__probeResults.push({m: c.join(','), ok: false, e: String((err && err.message) || err).substring(0, 200)});
                     });
                 });
             });
-            return 'probing_' + methods.length;
+            return 'probing_' + calls.length;
         } catch(e) { return 'error:' + e.message; }
         })();
         """)
         log.info(f"Livewire 方法探测启动: {launch}")
         if str(launch).startswith("probing"):
-            time.sleep(25)
+            time.sleep(35)
             results = sb.execute_script("return JSON.stringify(window.__probeResults || [])")
             probed = json.loads(results) if results else []
             found = []
@@ -659,11 +678,98 @@ def probe_livewire_methods(sb):
                 else:
                     log.info(f"[PROBE] {m['m']}: {m.get('e', '')[:120]}")
             if found:
-                log.warning(f">>> 可用的 Livewire 方法: {found} —— 可直接 $wire.call 调用")
+                log.warning(f">>> 可用的 Livewire 调用: {found}")
             else:
                 log.info(">>> 未发现可用方法（或全部被拒）")
+            ts_now = get_expires_ts(sb)
+            log.info(f"[PROBE] 探测后 expiresTimestamp: {ts_now}")
     except Exception as e:
         log.warning(f"方法探测异常: {e}")
+
+
+_SCAN_DONE = {"done": False}
+
+def scan_page_js(sb):
+    """下载页面所有脚本（内联+外链），搜索续期/广告/Turnstile 相关代码，
+    定位 '+90 min' 按钮点击处理器的真实逻辑与前置条件。
+    每次运行只执行一次，完整结果存 debug_output/js_scan.txt。"""
+    if _SCAN_DONE["done"]:
+        return
+    _SCAN_DONE["done"] = True
+    KEYWORDS = r"(watchAd|claimAd|adReward|rewardAd|startAd|renewal-timer|turnstile\.render|cf-turnstile|watch ad|watch-ad|adCooldown|expiresTimestamp|swapscape|ramp\.spa)"
+    try:
+        raw = sb.execute_script("""
+        (function(){
+        var inline = [], external = [];
+        var scripts = document.querySelectorAll('script');
+        for (var i = 0; i < scripts.length; i++) {
+            var sc = scripts[i];
+            if (sc.src) external.push(sc.src);
+            else if ((sc.textContent || '').length > 40) inline.push(sc.textContent);
+        }
+        return JSON.stringify({inline: inline, external: external});
+        })();
+        """)
+        data = json.loads(raw) if raw else {}
+        inline_list = data.get("inline", []) or []
+        external_list = data.get("external", []) or []
+        log.info(f"JS 扫描: 内联脚本 {len(inline_list)} 个, 外链 {len(external_list)} 个")
+        hits = []
+
+        def scan_text(name, text):
+            if not text:
+                return
+            try:
+                count = 0
+                for m in re.finditer(KEYWORDS, text, re.IGNORECASE):
+                    s = max(0, m.start() - 300)
+                    e = min(len(text), m.end() + 300)
+                    hits.append({"src": str(name)[:140], "kw": m.group(0), "ctx": text[s:e].replace("\n", " ")[:650]})
+                    count += 1
+                    if count >= 4 or len(hits) >= 60:
+                        return
+            except Exception:
+                pass
+
+        for idx, t in enumerate(inline_list):
+            scan_text(f"inline#{idx}", t)
+        for src in external_list[:14]:
+            text = None
+            try:
+                r = requests.get(src, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+                if r.ok and "just a moment" not in r.text[:600].lower():
+                    text = r.text
+            except Exception as e:
+                log.info(f"  下载失败 {src[:100]}: {str(e)[:80]}")
+            if not text:
+                # 回退：页面上下文同步 XHR（同源带 cookie，可过 CF）
+                try:
+                    text = sb.execute_script("""
+        (function(){
+        try {
+            var xhr = new XMLHttpRequest();
+            xhr.open('GET', '%s', false);
+            xhr.send(null);
+            if (xhr.status >= 200 && xhr.status < 400) return xhr.responseText.substring(0, 1500000);
+            return 'HTTP_' + xhr.status;
+        } catch(e) { return 'FETCH_ERR:' + e.message; }
+        })();
+        """ % src)
+                except Exception as e:
+                    log.info(f"  页面 fetch 失败 {src[:100]}: {str(e)[:80]}")
+            if text and not str(text).startswith("FETCH_ERR"):
+                scan_text(src, text[:1500000])
+            else:
+                hits.append({"src": str(src)[:140], "kw": "FETCH_FAIL", "ctx": str(text)[:150]})
+        out_path = SHOT_DIR / "js_scan.txt"
+        with open(out_path, "w", encoding="utf-8") as f:
+            for h in hits:
+                f.write(f"=== {h['src']} [{h['kw']}]\n{h['ctx']}\n\n")
+        log.warning(f"JS 扫描完成: {len(hits)} 处命中, 完整结果已存 {out_path}")
+        for h in hits[:8]:
+            log.warning(f"[JS] {h['src']} [{h['kw']}]: {h['ctx'][:280]}")
+    except Exception as e:
+        log.warning(f"JS 扫描异常: {e}")
 
 
 def get_expires_ts(sb) -> int:
