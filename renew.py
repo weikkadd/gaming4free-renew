@@ -479,7 +479,7 @@ _LW_HOOK_JS = """
                 p.then(function(res){
                     try {
                         res.clone().text().then(function(t){
-                            window.__lwResponses.push({type:'fetch', url:String(url).substring(0,120), status:res.status, body:t.substring(0,3000)});
+                            window.__lwResponses.push({type:'fetch', url:String(url).substring(0,120), status:res.status, body:t.substring(0,60000)});
                         });
                     } catch(e) {}
                 }).catch(function(){});
@@ -493,7 +493,7 @@ _LW_HOOK_JS = """
             var xhr = this;
             if (String(xhr.__lwUrl || '').indexOf('livewire') !== -1) {
                 xhr.addEventListener('load', function(){
-                    try { window.__lwResponses.push({type:'xhr', url:String(xhr.__lwUrl).substring(0,120), status:xhr.status, body:String(xhr.responseText||'').substring(0,3000)}); } catch(e) {}
+                    try { window.__lwResponses.push({type:'xhr', url:String(xhr.__lwUrl).substring(0,120), status:xhr.status, body:String(xhr.responseText||'').substring(0,60000)}); } catch(e) {}
                 });
             }
             return origSend.apply(this, arguments);
@@ -568,6 +568,51 @@ def capture_renew_response(sb):
     except Exception as e:
         log.warning(f"页面诊断失败: {e}")
 
+    # 1b) 定位 +90min 按钮所属的 Livewire 组件，dump 其完整 HTML（含 Alpine x-data/@click 绑定）
+    try:
+        owner_raw = sb.execute_script("""
+        (function(){
+        var btns = document.querySelectorAll('button, a, [role=button]');
+        var btn = null;
+        for (var i = 0; i < btns.length; i++) {
+            var t = (btns[i].innerText || '').trim();
+            if (/(?:\\+\\s*)?90\\s*min/i.test(t) && !/[$￥¥€]/.test(t) && !/24\\s*h/i.test(t)) { btn = btns[i]; break; }
+        }
+        if (!btn) return JSON.stringify({found: false});
+        var a = btn, owner = null;
+        while (a) { if (a.getAttribute && a.getAttribute('wire\\\\:id')) { owner = a; break; } a = a.parentElement; }
+        var comps = [];
+        var wc = document.querySelectorAll('[wire\\\\:id]');
+        for (var j = 0; j < wc.length; j++) {
+            comps.push({id: String(wc[j].getAttribute('wire\\\\:id') || '').substring(0, 14),
+                        name: String(wc[j].getAttribute('wire\\\\:name') || '')});
+        }
+        var tsInp = document.querySelector('[name="cf-turnstile-response"]');
+        var tsParent = tsInp && tsInp.parentElement ? tsInp.parentElement.outerHTML.substring(0, 800) : '';
+        return JSON.stringify({found: true,
+            ownerName: owner ? (owner.getAttribute('wire\\\\:name') || '?') : 'none',
+            ownerId: owner ? String(owner.getAttribute('wire\\\\:id') || '').substring(0, 14) : '',
+            ownerHtml: owner ? owner.outerHTML.substring(0, 30000) : '',
+            btnNoOwner: owner ? '' : btn.outerHTML.substring(0, 800),
+            tsParent: tsParent,
+            components: comps});
+        })();
+        """)
+        od = json.loads(owner_raw) if owner_raw else {}
+        if od.get("found"):
+            log.warning(f"按钮所属组件: name={od.get('ownerName')} id={od.get('ownerId')} "
+                        f"(页面共 {len(od.get('components', []))} 个 wire 组件: "
+                        f"{[c.get('name') for c in od.get('components', [])]})")
+            if od.get("tsParent"):
+                log.warning(f"Turnstile 容器 HTML: {od['tsParent'][:400]}")
+            with open(SHOT_DIR / "renew_component.html", "w", encoding="utf-8") as f:
+                f.write(od.get("ownerHtml") or od.get("btnNoOwner") or "")
+            log.info("组件完整 HTML 已存 debug_output/renew_component.html")
+        else:
+            log.warning("按钮未找到（可能正被 Livewire 重渲染）")
+    except Exception as e:
+        log.warning(f"组件定位失败: {e}")
+
     # 2) 页面 toast / 提示条
     try:
         toasts = sb.execute_script("""
@@ -625,8 +670,8 @@ def capture_renew_response(sb):
 _PROBE_DONE = {"done": False}
 
 def probe_livewire_methods(sb):
-    """对 renewal-timer 组件逐个尝试候选续期方法（含带参变体），找出服务端真实存在的调用。
-    调用不存在的方法 promise 会 reject（服务器报错）；存在则 resolve。
+    """对页面所有 Livewire 组件逐个尝试候选续期方法（含带参变体），找出服务端真实存在的调用。
+    调用不存在的方法 promise 会 reject；存在则 resolve。
     仅在首轮续期失败后执行一次。"""
     if _PROBE_DONE["done"]:
         return
@@ -637,50 +682,59 @@ def probe_livewire_methods(sb):
         try {
             if (!window.Livewire || !window.Livewire.all) return 'no_livewire';
             var comps = window.Livewire.all();
-            var comp = null;
+            var targets = [];
             for (var i = 0; i < comps.length; i++) {
-                try {
-                    var memo = comps[i].snapshot && comps[i].snapshot.memo;
-                    if (memo && memo.name === 'renewal-timer') { comp = comps[i]; break; }
-                } catch(e) {}
+                var name = '';
+                try { name = (comps[i].snapshot && comps[i].snapshot.memo && comps[i].snapshot.memo.name) || ''; } catch(e) {}
+                targets.push({c: comps[i], name: name || ('comp#' + i)});
             }
-            if (!comp) return 'component_not_found';
+            var METHODS = ['watchAd', 'claimAd', 'claimAdReward', 'rewardAd', 'startAd', 'extend'];
             window.__probeResults = [];
-            var calls = [
-                ['watchAd'], ['startAd'], ['claimAd'], ['claimAdReward'], ['rewardAd'], ['adReward'],
-                ['renew'], ['extend'], ['watchAdAndEarn'], ['claimFreeMinutes'],
-                ['extend', 90], ['extend', 5400], ['extend', '90'], ['claimAdReward', 90], ['rewardAd', 'completed']
-            ];
             var chain = Promise.resolve();
-            calls.forEach(function(c) {
+            function probeComp(c, label) {
+                METHODS.forEach(function(m) {
+                    chain = chain.then(function() {
+                        return c.$wire.call(m).then(function(resp) {
+                            window.__probeResults.push({c: label, m: m, ok: true, r: JSON.stringify(resp).substring(0, 200)});
+                        }).catch(function(err) {
+                            window.__probeResults.push({c: label, m: m, ok: false, e: String((err && err.message) || err).substring(0, 120)});
+                        });
+                    });
+                });
+            }
+            // 全组件扫描基础方法
+            for (var k = 0; k < targets.length; k++) probeComp(targets[k].c, targets[k].name);
+            // extend 带参变体：在每个组件上试一次 extend(90)
+            targets.forEach(function(t) {
                 chain = chain.then(function() {
-                    return comp.$wire.call.apply(comp.$wire, c).then(function(resp) {
-                        window.__probeResults.push({m: c.join(','), ok: true, r: JSON.stringify(resp).substring(0, 250)});
+                    return t.c.$wire.call('extend', 90).then(function(resp) {
+                        window.__probeResults.push({c: t.name, m: 'extend(90)', ok: true, r: JSON.stringify(resp).substring(0, 200)});
                     }).catch(function(err) {
-                        window.__probeResults.push({m: c.join(','), ok: false, e: String((err && err.message) || err).substring(0, 200)});
+                        window.__probeResults.push({c: t.name, m: 'extend(90)', ok: false, e: String((err && err.message) || err).substring(0, 120)});
                     });
                 });
             });
-            return 'probing_' + calls.length;
+            return 'probing_' + targets.length + 'x' + (METHODS.length + 1);
         } catch(e) { return 'error:' + e.message; }
         })();
         """)
         log.info(f"Livewire 方法探测启动: {launch}")
         if str(launch).startswith("probing"):
-            time.sleep(35)
+            time.sleep(110)
             results = sb.execute_script("return JSON.stringify(window.__probeResults || [])")
             probed = json.loads(results) if results else []
-            found = []
+            by_comp = {}
             for m in probed:
+                key = m.get("c", "?")
+                by_comp.setdefault(key, {"ok": [], "bad": []})
                 if m.get("ok"):
-                    found.append(m["m"])
-                    log.warning(f"[PROBE] 方法存在: {m['m']} resp={m.get('r', '')[:200]}")
+                    by_comp[key]["ok"].append(f"{m['m']} -> {m.get('r', '')[:80]}")
                 else:
-                    log.info(f"[PROBE] {m['m']}: {m.get('e', '')[:120]}")
-            if found:
-                log.warning(f">>> 可用的 Livewire 调用: {found}")
-            else:
-                log.info(">>> 未发现可用方法（或全部被拒）")
+                    by_comp[key]["bad"].append(m["m"])
+            for comp, res in by_comp.items():
+                if res["ok"]:
+                    log.warning(f"[PROBE] 组件 {comp}: 可用调用 {res['ok']}")
+                log.info(f"[PROBE] 组件 {comp}: 无效 {res['bad']}")
             ts_now = get_expires_ts(sb)
             log.info(f"[PROBE] 探测后 expiresTimestamp: {ts_now}")
     except Exception as e:
