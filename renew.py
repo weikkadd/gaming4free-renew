@@ -572,7 +572,7 @@ def click_renew_button(sb) -> bool:
         }
         return 'not_found';
         })();
-        """)
+        """))
         if not result.startswith("clicked:"):
             log.warning(f"+90min 续期按钮未找到: {result}")
             return False
