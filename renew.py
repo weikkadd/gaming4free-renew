@@ -554,6 +554,28 @@ def capture_renew_response(sb):
             var tsInput = document.querySelector('[name="cf-turnstile-response"]');
             out.tsInput = tsInput ? ('present,len=' + (tsInput.value || '').length) : 'absent';
             out.cfIframes = document.querySelectorAll('iframe[src*="challenges.cloudflare.com"]').length;
+            out.turnstileApi = (function(){
+                try {
+                    if (typeof turnstile === 'undefined') return 'absent';
+                    var w = window._g4fTsWidgetId, own = window.__g4fOwnWid;
+                    return JSON.stringify({
+                        site: w ? String(turnstile.getResponse(w)).substring(0, 20) : '-',
+                        own: own ? String(turnstile.getResponse(own)).substring(0, 20) : '-',
+                        ownWid: String(own || ''),
+                        ownToken: String(window.__g4fOwnToken || '').substring(0, 20)
+                    });
+                } catch(e) { return 'err:' + e.message; }
+            })();
+            out.allIframeSrcs = [];
+            var ifrAll = document.querySelectorAll('iframe');
+            for (var q = 0; q < ifrAll.length && q < 14; q++) {
+                out.allIframeSrcs.push(String(ifrAll[q].src || '(srcless)').substring(0, 90));
+            }
+            out.cfContainers = [];
+            var cfsAll = document.querySelectorAll('[id^="cf-chl-widget"]');
+            for (var q2 = 0; q2 < cfsAll.length && q2 < 6; q2++) {
+                out.cfContainers.push(cfsAll[q2].outerHTML.substring(0, 150));
+            }
             out.postMessages = (window.__postMessages || []).slice(-3);
             return JSON.stringify(out);
         })();
@@ -766,6 +788,10 @@ def dump_alpine_state(sb):
             var out = {};
             out.extendClicked = (typeof data.extendClicked === 'function')
                 ? data.extendClicked.toString().substring(0, 12000) : ('type:' + typeof data.extendClicked);
+            out.showExtendCaptcha = (typeof data.showExtendCaptcha === 'function')
+                ? data.showExtendCaptcha.toString().substring(0, 12000) : ('type:' + typeof data.showExtendCaptcha);
+            out.watchWebAd = (typeof data.watchWebAd === 'function')
+                ? data.watchWebAd.toString().substring(0, 8000) : ('type:' + typeof data.watchWebAd);
             var fns = [], vals = {};
             for (var k in data) {
                 try {
@@ -807,8 +833,16 @@ def dump_alpine_state(sb):
             return
         src = d.get("extendClicked", "")
         log.warning(f"=== extendClicked 源码 ===\n{src[:3500]}\n=== extendClicked 源码结束 (全长 {len(src)}) ===")
+        # 直接按名字取另外两个关键函数（for..in 枚举 Alpine proxy 会漏）
+        sec = d.get("showExtendCaptcha", "")
+        wwa = d.get("watchWebAd", "")
+        if sec:
+            log.warning(f"=== showExtendCaptcha 源码 ===\n{sec[:3000]}\n=== showExtendCaptcha 结束 (全长 {len(sec)}) ===")
+        if wwa:
+            log.warning(f"=== watchWebAd 源码 ===\n{wwa[:2500]}\n=== watchWebAd 结束 (全长 {len(wwa)}) ===")
         with open(SHOT_DIR / "extend_clicked.js", "w", encoding="utf-8") as f:
-            f.write(src)
+            f.write(src + "\n\n// ==== showExtendCaptcha ====\n" + sec
+                    + "\n\n// ==== watchWebAd ====\n" + wwa)
         log.warning(f"Alpine 状态: {json.dumps(d.get('state', {}), ensure_ascii=False)}")
         log.warning(f"Alpine 函数: {', '.join(x.split(':')[0] for x in d.get('functions', []))}")
         for g in d.get("g4fGlobals", [])[:12]:
@@ -1065,6 +1099,34 @@ def click_renew_button(sb) -> bool:
             log.warning(f"合成点击异常: {e}")
             return False
 
+    # 自建 Turnstile widget（body 直挂，不受 Livewire morph/teleport 影响）：
+    # token 仍来自真实挑战（同 sitekey，服务端校验可过），拿到后喂给站点回调 _g4fTsCallback
+    try:
+        rr = sb.execute_script("""
+        (function(){
+        try {
+            if (window.__g4fOwnWid) return 'already';
+            if (typeof turnstile === 'undefined') return 'no_turnstile';
+            var old = document.getElementById('g4f-own-ts');
+            if (old) old.remove();
+            var c = document.createElement('div');
+            c.id = 'g4f-own-ts';
+            c.style.cssText = 'position:fixed;bottom:20px;right:20px;z-index:999999;background:#0b0b13;padding:10px;border-radius:8px;box-shadow:0 0 18px rgba(0,0,0,.6);';
+            document.body.appendChild(c);
+            window.__g4fOwnToken = '';
+            window.__g4fOwnWid = turnstile.render('#g4f-own-ts', {
+                sitekey: '0x4AAAAAADWeWAriMB7Vsqya',
+                theme: 'dark',
+                callback: function(tok) { window.__g4fOwnToken = tok || ''; }
+            });
+            return 'rendered:' + window.__g4fOwnWid;
+        } catch(e) { return 'error:' + e.message; }
+        })();
+        """)
+        log.info(f"自建 Turnstile widget（body 直挂）: {rr}")
+    except Exception as e:
+        log.warning(f"自建 widget 渲染异常: {e}")
+
     # 4) 点击后统一等待（最多约 120s）：
     #    点击 → g4fRewarded.request()（~5s no_fill）→ showExtendCaptcha → #g4f-ts-modal
     #    → Turnstile 挑战 → token → 站点回调(_g4fTsCallback) 自动完成续期。
@@ -1081,9 +1143,30 @@ def click_renew_button(sb) -> bool:
         (function(){
         function visible(el){ var r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; }
         // ── g4f Turnstile 流程（最高优先级）──
+        var ownTok = String(window.__g4fOwnToken || '');
+        var tsCb = window._g4fTsCallback;
+        if (ownTok && ownTok.length > 20 && typeof tsCb === 'function') {
+            // 自建 widget 拿到真 token 且站点回调已就位 → 喂给站点完成续期
+            g4fCloseTurnstile();
+            window._g4fTsCallback = null;
+            window.__g4fOwnToken = '';
+            try { turnstile.remove(window.__g4fOwnWid); } catch(e) {}
+            window.__g4fOwnWid = null;
+            tsCb(ownTok);
+            return 'ts_token_ok:fed';
+        }
         var tins = document.querySelectorAll('[name="cf-turnstile-response"]');
         for (var ti = 0; ti < tins.length; ti++) {
-            if (tins[ti].value && tins[ti].value.length > 20) return 'ts_token_ok';
+            if (tins[ti].value && tins[ti].value.length > 20) return 'ts_token_ok:input';
+        }
+        // 自建 widget 的挑战 iframe（body 直挂，永远找得到）→ CDP 点击 checkbox
+        var ownBox = document.getElementById('g4f-own-ts');
+        var ownIfr = ownBox ? ownBox.querySelector('iframe') : null;
+        if (ownIfr) {
+            var ofr = ownIfr.getBoundingClientRect();
+            if (ofr.width > 0 && ofr.height > 0) {
+                return 'own_ts_iframe:x=' + Math.round(ofr.left) + ',y=' + Math.round(ofr.top) + ',w=' + Math.round(ofr.width) + ',h=' + Math.round(ofr.height);
+            }
         }
         var g4fModal = document.getElementById('g4f-ts-modal');
         if (g4fModal && g4fModal.style.display === 'flex') {
@@ -1174,6 +1257,24 @@ def click_renew_button(sb) -> bool:
                 log.info("✅ Turnstile token 已就绪，站点回调将自动完成续期")
                 return True
             time.sleep(2)
+            continue
+
+        if state.startswith("own_ts_iframe:"):
+            # 自建 widget 的挑战 iframe：CDP 点击 checkbox（左侧中部）
+            m = re.search(r"x=(\d+),y=(\d+),w=(\d+),h=(\d+)", state)
+            if m and ts_clicks < 4:
+                ts_clicks += 1
+                cx = int(m.group(1)) + min(28, int(m.group(3)) // 3)
+                cy = int(m.group(2)) + int(m.group(4)) // 2
+                try:
+                    sb.driver.execute_cdp_cmd("Input.dispatchMouseEvent",
+                        {"type": "mousePressed", "x": cx, "y": cy, "button": "left", "clickCount": 1})
+                    sb.driver.execute_cdp_cmd("Input.dispatchMouseEvent",
+                        {"type": "mouseReleased", "x": cx, "y": cy, "button": "left", "clickCount": 1})
+                    log.info(f"已点击自建 widget 挑战框 ({cx},{cy})，等待 token... (第{ts_clicks}次)")
+                except Exception as e:
+                    log.warning(f"自建 widget 点击异常: {e}")
+            time.sleep(4)
             continue
 
         if state.startswith("ts_iframe:"):
