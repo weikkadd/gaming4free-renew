@@ -406,16 +406,59 @@ _LW_HOOK_JS = """
             return ret;
         };
     } catch(e) {}
-    // postMessage 捕获（广告完成回调通常 postMessage 通知父页）
+    // postMessage 捕获（广告完成回调通常 postMessage 通知父页；cloudflare 心跳最多留 2 条）
     try {
         window.addEventListener('message', function(ev) {
             try {
+                var isCf = String(ev.origin || '').indexOf('challenges.cloudflare.com') !== -1;
+                if (isCf) {
+                    var cfCount = 0;
+                    for (var q = 0; q < window.__postMessages.length; q++) { if (window.__postMessages[q].cf) cfCount++; }
+                    if (cfCount >= 2) return;
+                }
                 window.__postMessages.push({
+                    cf: isCf,
                     origin: String(ev.origin || '').substring(0, 80),
-                    data: String(typeof ev.data === 'object' ? JSON.stringify(ev.data) : ev.data).substring(0, 300),
+                    data: String(typeof ev.data === 'object' ? JSON.stringify(ev.data) : ev.data).substring(0, 150),
                     time: Date.now()
                 });
-                if (window.__postMessages.length > 20) window.__postMessages.shift();
+                if (window.__postMessages.length > 10) window.__postMessages.shift();
+            } catch(e) {}
+        });
+    } catch(e) {}
+    // 全局 click 捕获：验证受信任点击是否真的落在续期按钮上
+    try {
+        window.__clicks = [];
+        document.addEventListener('click', function(e) {
+            try {
+                var el = e.target;
+                var onRenew = false;
+                while (el) { if (el.getAttribute && el.getAttribute('data-g4f-renew')) { onRenew = true; break; } el = el.parentElement; }
+                window.__clicks.push({
+                    trusted: !!e.isTrusted,
+                    tag: e.target && e.target.tagName ? e.target.tagName : '?',
+                    onRenewBtn: onRenew,
+                    x: e.clientX, y: e.clientY,
+                    time: Date.now()
+                });
+                if (window.__clicks.length > 30) window.__clicks.shift();
+            } catch(err) {}
+        }, true);
+    } catch(e) {}
+    // JS 错误捕获（处理器静默异常会留痕）
+    try {
+        window.__jsErrors = [];
+        window.addEventListener('error', function(ev) {
+            try {
+                window.__jsErrors.push({msg: String(ev.message || '').substring(0, 200), src: String(ev.filename || '').substring(0, 100), line: ev.lineno, time: Date.now()});
+                if (window.__jsErrors.length > 10) window.__jsErrors.shift();
+            } catch(e) {}
+        }, true);
+        window.addEventListener('unhandledrejection', function(ev) {
+            try {
+                var r = ev.reason;
+                window.__jsErrors.push({rejection: String((r && r.message) || r || '').substring(0, 200), time: Date.now()});
+                if (window.__jsErrors.length > 10) window.__jsErrors.shift();
             } catch(e) {}
         });
     } catch(e) {}
@@ -465,16 +508,21 @@ def capture_renew_response(sb):
     """续期点击未生效时：抓取页面上下文证据（弹窗/回调/提示/Livewire 响应）定位真实原因。
     注意：UC 模式下 sb.* API（走 CDP 通道）可靠，原生 sb.driver.* 可能 connection refused，
     所以页面内诊断放最前，原生 driver 调用放最后且失败不影响其余步骤。"""
-    # 1) window.open 弹窗记录 + postMessage 回调 + 广告 SDK 状态（页面上下文，最可靠）
+    # 1) 页面上下文诊断：按钮真实绑定/点击落点/弹窗/回调/SDK（不依赖 chromedriver）
     try:
         diag = sb.execute_script("""
         (function(){
             var out = {};
+            var el = document.querySelector('[data-g4f-renew]');
+            out.btnHtml = el ? el.outerHTML.substring(0, 400) : 'no_marked_btn';
+            out.parentHtml = (el && el.parentElement) ? el.parentElement.outerHTML.substring(0, 700) : '';
             out.popups = (window.__popups || []).slice(-5);
-            out.postMessages = (window.__postMessages || []).slice(-8);
+            out.clicks = (window.__clicks || []).slice(-8);
+            out.jsErrors = (window.__jsErrors || []).slice(-5);
             out.sdk = {
                 ramp: typeof window.ramp !== 'undefined',
                 vidazoo: typeof window.vidazoo !== 'undefined',
+                alpine: typeof window.Alpine !== 'undefined',
                 pw: typeof window.pw !== 'undefined'
             };
             var adScripts = [];
@@ -484,13 +532,28 @@ def capture_renew_response(sb):
                 if (/playwire|ramp|vidazoo|swapscape|reward/i.test(s)) adScripts.push(s.substring(0, 120));
             }
             out.adScripts = adScripts.slice(0, 6);
+            try {
+                var adRes = [];
+                var res = performance.getEntriesByType('resource') || [];
+                for (var j = 0; j < res.length; j++) {
+                    var nm = res[j].name || '';
+                    if (/playwire|ramp|vidazoo|swapscape|rewarded/i.test(nm)) {
+                        adRes.push({n: nm.substring(0, 100), size: res[j].transferSize || 0, ms: Math.round(res[j].duration || 0)});
+                    }
+                }
+                out.adResources = adRes.slice(0, 8);
+            } catch(e) {}
+            var tsInput = document.querySelector('[name="cf-turnstile-response"]');
+            out.tsInput = tsInput ? ('present,len=' + (tsInput.value || '').length) : 'absent';
+            out.cfIframes = document.querySelectorAll('iframe[src*="challenges.cloudflare.com"]').length;
+            out.postMessages = (window.__postMessages || []).slice(-3);
             return JSON.stringify(out);
         })();
         """)
         if diag:
-            log.warning(f"弹窗/回调/SDK 诊断: {str(diag)[:1200]}")
+            log.warning(f"页面上下文诊断: {str(diag)[:2500]}")
     except Exception as e:
-        log.warning(f"弹窗诊断失败: {e}")
+        log.warning(f"页面诊断失败: {e}")
 
     # 2) 页面 toast / 提示条
     try:
@@ -538,6 +601,69 @@ def capture_renew_response(sb):
             sb.driver.switch_to.window(handles[0])
     except Exception as e:
         log.warning(f"标签页检查失败(driver 不可用时忽略): {str(e)[:120]}")
+
+    # 6) Livewire 方法探测（每次运行只做一次）
+    probe_livewire_methods(sb)
+
+
+_PROBE_DONE = {"done": False}
+
+def probe_livewire_methods(sb):
+    """对 renewal-timer 组件逐个尝试候选续期方法名，找出服务端真实存在的方法。
+    调用不存在的方法 promise 会 reject（服务器报错）；存在则 resolve。
+    仅在首轮续期失败后执行一次。"""
+    if _PROBE_DONE["done"]:
+        return
+    _PROBE_DONE["done"] = True
+    try:
+        launch = sb.execute_script("""
+        (function(){
+        try {
+            if (!window.Livewire || !window.Livewire.all) return 'no_livewire';
+            var comps = window.Livewire.all();
+            var comp = null;
+            for (var i = 0; i < comps.length; i++) {
+                try {
+                    var memo = comps[i].snapshot && comps[i].snapshot.memo;
+                    if (memo && memo.name === 'renewal-timer') { comp = comps[i]; break; }
+                } catch(e) {}
+            }
+            if (!comp) return 'component_not_found';
+            window.__probeResults = [];
+            var methods = ['watchAd', 'startAd', 'claimAd', 'claimAdReward', 'rewardAd', 'adReward',
+                           'renew', 'extend', 'watchAdAndEarn', 'claimFreeMinutes'];
+            var chain = Promise.resolve();
+            methods.forEach(function(m) {
+                chain = chain.then(function() {
+                    return comp.$wire.call(m).then(function(resp) {
+                        window.__probeResults.push({m: m, ok: true, r: JSON.stringify(resp).substring(0, 250)});
+                    }).catch(function(err) {
+                        window.__probeResults.push({m: m, ok: false, e: String((err && err.message) || err).substring(0, 200)});
+                    });
+                });
+            });
+            return 'probing_' + methods.length;
+        } catch(e) { return 'error:' + e.message; }
+        })();
+        """)
+        log.info(f"Livewire 方法探测启动: {launch}")
+        if str(launch).startswith("probing"):
+            time.sleep(25)
+            results = sb.execute_script("return JSON.stringify(window.__probeResults || [])")
+            probed = json.loads(results) if results else []
+            found = []
+            for m in probed:
+                if m.get("ok"):
+                    found.append(m["m"])
+                    log.warning(f"[PROBE] 方法存在: {m['m']} resp={m.get('r', '')[:200]}")
+                else:
+                    log.info(f"[PROBE] {m['m']}: {m.get('e', '')[:120]}")
+            if found:
+                log.warning(f">>> 可用的 Livewire 方法: {found} —— 可直接 $wire.call 调用")
+            else:
+                log.info(">>> 未发现可用方法（或全部被拒）")
+    except Exception as e:
+        log.warning(f"方法探测异常: {e}")
 
 
 def get_expires_ts(sb) -> int:
@@ -630,7 +756,11 @@ def click_renew_button(sb) -> bool:
             for (var k = 0; k < olds.length; k++) olds[k].removeAttribute('data-g4f-renew');
             el.setAttribute('data-g4f-renew', '1');
             var wireAttr = el.getAttribute('wire:click') || el.getAttribute('wire:click.prevent') || 'none';
-            return 'marked:' + t.substring(0, 40) + '|tag=' + el.tagName + '|wire=' + wireAttr;
+            // 落点检测：若按钮中心被其它元素覆盖，真实点击会点在覆盖层上
+            var cx = r.left + r.width/2, cy = r.top + r.height/2;
+            var hit = document.elementFromPoint(cx, cy);
+            var hitInfo = (hit === el || el.contains(hit)) ? 'ok' : (hit ? 'blocked_by:' + hit.tagName + '.' + String(hit.className || '').substring(0, 40) : 'none');
+            return 'marked:' + t.substring(0, 40) + '|tag=' + el.tagName + '|wire=' + wireAttr + '|hit=' + hitInfo;
         }
         return 'not_found';
         })();
