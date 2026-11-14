@@ -666,6 +666,9 @@ def capture_renew_response(sb):
     # 7) 站点 JS 源码扫描（每次运行只做一次，定位按钮处理器真实逻辑）
     scan_page_js(sb)
 
+    # 8) Alpine 状态与 extendClicked 源码 dump（每次运行只做一次）
+    dump_alpine_state(sb)
+
 
 _PROBE_DONE = {"done": False}
 
@@ -742,6 +745,94 @@ def probe_livewire_methods(sb):
 
 
 _SCAN_DONE = {"done": False}
+
+_ALPINE_DONE = {"done": False}
+
+def dump_alpine_state(sb):
+    """直接从 Alpine 组件作用域拿 extendClicked() 源码 + 全部函数名 + g4f* 全局 + 内联脚本全文。
+    这是定位续期流程前置条件与最终 Livewire 调用参数的最直接途径。每次运行只执行一次。"""
+    if _ALPINE_DONE["done"]:
+        return
+    _ALPINE_DONE["done"] = True
+    try:
+        raw = sb.execute_script("""
+        (function(){
+        try {
+            if (!window.Alpine) return JSON.stringify({err: 'no_alpine'});
+            var el = document.querySelector('.rt-btn-free') || document.querySelector('.rt-actions') || document.querySelector('.rt-root');
+            if (!el) return JSON.stringify({err: 'no_button_element'});
+            var data = Alpine.$data(el);
+            if (!data) return JSON.stringify({err: 'no_alpine_data'});
+            var out = {};
+            out.extendClicked = (typeof data.extendClicked === 'function')
+                ? data.extendClicked.toString().substring(0, 12000) : ('type:' + typeof data.extendClicked);
+            var fns = [], vals = {};
+            for (var k in data) {
+                try {
+                    var v = data[k];
+                    if (typeof v === 'function') {
+                        if (k !== 'extendClicked') fns.push(k + ': ' + v.toString().substring(0, 500));
+                    } else if (['isPremium','isNativeApp','extendDisabled','adLoading','webAdLoading',
+                                'adWaiting','adCooldown','adCdLabel','webAdUrl','adSession','adFill',
+                                'cooldownSecs','expires','balance','paidCost'].indexOf(k) !== -1) {
+                        vals[k] = String(v).substring(0, 120);
+                    }
+                } catch(e) {}
+            }
+            out.state = vals;
+            out.functions = fns;
+            out.g4fGlobals = [];
+            for (var g in window) {
+                try {
+                    if (/^g4f/i.test(g)) {
+                        if (typeof window[g] === 'function') out.g4fGlobals.push(g + ': ' + window[g].toString().substring(0, 600));
+                        else out.g4fGlobals.push(g + ' = ' + String(window[g]).substring(0, 120));
+                    }
+                } catch(e) {}
+            }
+            out.tsLoaded = typeof window.turnstile !== 'undefined';
+            out._g4fTsWidgetId = String(window._g4fTsWidgetId);
+            out.tsInputs = [];
+            var tins = document.querySelectorAll('[name="cf-turnstile-response"]');
+            for (var i = 0; i < tins.length; i++) {
+                out.tsInputs.push({id: tins[i].id || '', len: (tins[i].value || '').length});
+            }
+            return JSON.stringify(out);
+        } catch(e) { return JSON.stringify({err: String(e)}); }
+        })();
+        """)
+        d = json.loads(raw) if raw else {}
+        if d.get("err"):
+            log.warning(f"Alpine dump 失败: {d['err']}")
+            return
+        src = d.get("extendClicked", "")
+        log.warning(f"=== extendClicked 源码 ===\n{src[:3500]}\n=== extendClicked 源码结束 (全长 {len(src)}) ===")
+        with open(SHOT_DIR / "extend_clicked.js", "w", encoding="utf-8") as f:
+            f.write(src)
+        log.warning(f"Alpine 状态: {json.dumps(d.get('state', {}), ensure_ascii=False)}")
+        log.warning(f"Alpine 函数: {', '.join(x.split(':')[0] for x in d.get('functions', []))}")
+        for g in d.get("g4fGlobals", [])[:12]:
+            log.warning(f"[G4F] {g[:400]}")
+        log.warning(f"turnstile: loaded={d.get('tsLoaded')} _g4fTsWidgetId={d.get('_g4fTsWidgetId')} "
+                    f"inputs={json.dumps(d.get('tsInputs', []))}")
+        # 内联脚本全文落盘（g4fTurnstile / 广告队列编排器都在里面）
+        inline_raw = sb.execute_script("""
+        (function(){
+        var out = [];
+        var scripts = document.querySelectorAll('script:not([src])');
+        for (var i = 0; i < scripts.length; i++) {
+            var t = scripts[i].textContent || '';
+            if (t.length > 200) out.push('===== inline#' + i + ' (' + t.length + ' chars) =====\\n' + t.substring(0, 50000));
+        }
+        return out.join('\\n\\n');
+        })();
+        """)
+        if inline_raw:
+            with open(SHOT_DIR / "inline_scripts.txt", "w", encoding="utf-8") as f:
+                f.write(str(inline_raw))
+            log.info(f"内联脚本全文已存 debug_output/inline_scripts.txt ({len(str(inline_raw))} chars)")
+    except Exception as e:
+        log.warning(f"Alpine dump 异常: {e}")
 
 def scan_page_js(sb):
     """下载页面所有脚本（内联+外链），搜索续期/广告/Turnstile 相关代码，
