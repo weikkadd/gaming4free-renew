@@ -483,18 +483,77 @@ def capture_renew_response(sb):
         pass
 
 
+def get_expires_ts(sb) -> int:
+    """从已捕获的 Livewire 响应中解析服务端 expiresTimestamp（真值，比 UI 倒计时可靠）。
+    续期成功时该值会增加 90 分钟；广告未走完则保持不变。解析不到返回 0。"""
+    try:
+        out = sb.execute_script("""
+        (function(){
+            var arr = window.__lwResponses || [];
+            for (var i = arr.length - 1; i >= 0; i--) {
+                var m = String(arr[i].body || '').match(/expiresTimestamp[^0-9]*(\\d{9,12})/);
+                if (m) return parseInt(m[1], 10);
+            }
+            return 0;
+        })();
+        """)
+        return int(out or 0)
+    except Exception:
+        return 0
+
+
 def click_renew_button(sb) -> bool:
     """gaming4free 续期：点击 console 页 '+ 90 min' 免费按钮（'+24h $x' 付费按钮不碰）。
-    点击后用请求捕获 hook 校验是否真的发出 Livewire 请求，被吞时退回按钮 wire 方法直调。"""
-    from util import _LW_CALL_BUTTON_JS
-    # 安装 Livewire 请求捕获 hook（失败不影响点击），并记录响应计数基线
+    免费续期 = 看广告得时长（v5 机制）：
+      1) 点击前轮询等待按钮就绪（文案变为 watch ad 模式 / 从 disabled 恢复）
+      2) 点击后统一等待：Playwire 广告播完 -> 容器内点「领取/继续」；或确认弹窗/Turnstile
+      3) 以服务端 expiresTimestamp 为真值判定生效
+      4) 全程不 refresh 页面（refresh 会打断正在进行的广告流程）"""
+    from util import _LW_CALL_BUTTON_JS, _AD_CLICK_JS
+    # 1) 安装 hook + 记录基线（服务端 expiresTimestamp 为续期真值）
     try:
         sb.execute_script(_LW_HOOK_JS)
-        lw_before = int(sb.execute_script("return (window.__lwResponses || []).length;") or 0)
     except Exception:
-        lw_before = 0
+        pass
+    ts_before = get_expires_ts(sb)
+    if ts_before:
+        log.info(f"基线 expiresTimestamp: {ts_before}")
+
+    # 2) 点击前：轮询等待按钮就绪（最多 45s）——文案切到 watch ad 或按钮从 disabled 恢复
+    ready = ""
+    for _ in range(9):
+        try:
+            ready = str(sb.execute_script("""
+        (function(){
+        var btns = document.querySelectorAll('button, a, [role=button]');
+        for (var i = 0; i < btns.length; i++) {
+            var el = btns[i];
+            var t = (el.innerText || el.textContent || '').trim();
+            if (!t || t.length > 60) continue;
+            if (!/(?:\\+\\s*)?90\\s*min/i.test(t)) continue;
+            if (/[$￥¥€]/.test(t) || /24\\s*h/i.test(t)) continue;
+            var r = el.getBoundingClientRect();
+            if (r.width === 0 || r.height === 0) return 'hidden';
+            if (el.disabled) return 'disabled';
+            return t.toLowerCase().indexOf('watch ad') !== -1 ? 'ad_ready' : 'ready';
+        }
+        return 'not_found';
+        })();
+        """))
+        except Exception as e:
+            log.warning(f"按钮就绪检测异常: {e}")
+            ready = 'not_found'
+        if ready in ("ready", "ad_ready"):
+            break
+        time.sleep(5)
+    if ready not in ("ready", "ad_ready"):
+        log.warning(f"续期按钮未就绪: {ready} —— 跳过本轮（冷却后重试）")
+        return False
+    log.info(f"按钮就绪: {ready}")
+
+    # 3) 点击按钮
     try:
-        result = sb.execute_script("""
+        result = str(sb.execute_script("""
         (function(){
         var candidates = document.querySelectorAll('button, a, [role=button], [wire\\\\:click], [wire\\\\:click\\\\.prevent]');
         for (var i = 0; i < candidates.length; i++) {
@@ -514,7 +573,7 @@ def click_renew_button(sb) -> bool:
         return 'not_found';
         })();
         """)
-        if not result or not str(result).startswith("clicked:"):
+        if not result.startswith("clicked:"):
             log.warning(f"+90min 续期按钮未找到: {result}")
             return False
         log.info(f"✅ 点击续期按钮: {result}")
@@ -522,17 +581,25 @@ def click_renew_button(sb) -> bool:
         log.warning(f"点击续期按钮异常: {e}")
         return False
 
-    time.sleep(4)
-
-    # 点击后：若出现确认弹窗/Turnstile 则等待通过并提交；无弹窗则视为点击即续期
+    # 4) 点击后统一等待（最多约 90s）：广告播放 -> 播完点领取；或确认弹窗/Turnstile
+    ad_seen = False
     no_modal_rounds = 0
     token_ok_rounds = 0
     ts_rendered = False
-    for wait_round in range(24):                       # 最多约 60s
+    for wait_round in range(30):
         try:
             state = str(sb.execute_script("""
         (function(){
         function visible(el){ var r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; }
+        // 广告容器/iframe（Playwire 等）
+        var adVisible = 0;
+        var adIframes = document.querySelectorAll('iframe[src*="playwire"], iframe[src*="swapscape"], iframe[src*="reward"], .vm-ad iframe, [class*="ad-iframe"] iframe');
+        for (var a = 0; a < adIframes.length; a++) { if (visible(adIframes[a])) adVisible++; }
+        if (adVisible === 0) {
+            var adNodes = document.querySelectorAll('.vm-ad, .ad-modal, [class*="reward-ad"], [class*="watch-ad"], .ad-container');
+            for (var b = 0; b < adNodes.length; b++) { if (visible(adNodes[b])) { adVisible = 1; break; } }
+        }
+        if (adVisible) return 'ad_playing';
         var nodes = document.querySelectorAll('.vm-captcha, .cf-turnstile, [role=dialog], .modal.show, .modal[style*="block"], .popup');
         var modal = null;
         for (var k = 0; k < nodes.length; k++) { if (visible(nodes[k])) { modal = nodes[k]; break; } }
@@ -575,44 +642,38 @@ def click_renew_button(sb) -> bool:
         })();
         """))
         except Exception as e:
-            log.warning(f"弹窗检测异常: {e}")
+            log.warning(f"弹窗/广告检测异常: {e}")
             state = 'no_modal'
 
+        if state == "ad_playing":
+            ad_seen = True
+            if wait_round % 5 == 0:
+                log.info(f"广告播放中... (~{wait_round*3}s)")
+            time.sleep(3)
+            continue
+
         if state.startswith("clicked:enable_ads"):
-            log.info("已点击 enable ads，继续等待确认...")
+            log.info("已点击 enable ads，继续等待...")
         elif state.startswith("clicked:"):
-            log.info(f"✅ 续期确认: {state}")
+            # 弹窗/Turnstile 里的确认按钮已点。若刚播完广告，再点一次容器内「领取/继续」
+            if ad_seen:
+                try:
+                    cr = str(sb.execute_script(_AD_CLICK_JS))
+                    if cr.startswith("clicked:"):
+                        log.info(f"✅ 广告完成后点击领取/继续: {cr}")
+                    elif cr == "ad_running":
+                        log.info(f"✅ 续期确认: {state}（广告容器仍活跃，稍后确认）")
+                    else:
+                        log.info(f"✅ 续期确认: {state}")
+                except Exception as e:
+                    log.warning(f"领取按钮点击异常: {e}")
+                    log.info(f"✅ 续期确认: {state}")
+            else:
+                log.info(f"✅ 续期确认: {state}")
             return True
         elif state == "no_modal":
             no_modal_rounds += 1
             token_ok_rounds = 0
-            # 无弹窗时校验点击是否真的发出了 Livewire 请求；
-            # 原生 el.click() 可能未被 Livewire 事件管线接住（请求根本没发出），
-            # 表现为 __lwResponses 计数不增加 —— 此时退回按钮 wire 方法直调
-            if no_modal_rounds >= 3:
-                try:
-                    lw_after = int(sb.execute_script("return (window.__lwResponses || []).length;") or 0)
-                except Exception:
-                    lw_after = lw_before
-                if lw_after > lw_before:
-                    log.info(f"无确认弹窗，已捕获 {lw_after - lw_before} 条 Livewire 请求，点击生效")
-                    return True
-                log.warning("无确认弹窗且未捕获到 Livewire 请求 —— 点击可能未进 Livewire 管线，退回 wire 方法直调...")
-                try:
-                    call_result = sb.execute_script(_LW_CALL_BUTTON_JS)
-                    log.info(f"按钮 wire 方法直调: {call_result}")
-                except Exception as e:
-                    log.warning(f"按钮 wire 方法直调异常: {e}")
-                time.sleep(3)
-                try:
-                    lw_after2 = int(sb.execute_script("return (window.__lwResponses || []).length;") or 0)
-                except Exception:
-                    lw_after2 = lw_after
-                if lw_after2 > lw_after:
-                    log.info(f"wire 方法直调后捕获 {lw_after2 - lw_after} 条 Livewire 请求，视为已触发")
-                    return True
-                log.warning("wire 方法直调后仍无 Livewire 请求，本次点击判定为未生效")
-                return False
         elif state == "waiting:token_ok":
             token_ok_rounds += 1
             no_modal_rounds = 0
@@ -622,16 +683,34 @@ def click_renew_button(sb) -> bool:
         else:
             no_modal_rounds = 0
             token_ok_rounds = 0
-            if wait_round % 4 == 0:
-                log.info(f"等待验证码/弹窗... ({state}, {wait_round+1}/24)")
-            # Turnstile 长时间未出 token：诊断 + 尝试手动渲染（每次点击只试一次）
-            if not ts_rendered and state == "waiting:token_missing" and wait_round >= 8:
+            if wait_round % 5 == 0:
+                log.info(f"等待验证码/弹窗... ({state}, {wait_round+1}/30)")
+            if not ts_rendered and state == "waiting:token_missing" and wait_round >= 10:
                 ts_rendered = True
                 try_render_turnstile(sb)
-        time.sleep(2.5)
+        time.sleep(3)
 
-    screenshot(sb, "renew_no_confirm")
-    log.warning("点击 +90min 后 60s 内未完成确认流程")
+    # 5) 最终判定：服务端 expiresTimestamp 为真值；无广告无弹窗时兜底 wire 方法直调
+    ts_after = get_expires_ts(sb)
+    if ts_after and ts_before and ts_after > ts_before:
+        log.info(f"✅ expiresTimestamp {ts_before} -> {ts_after}，续期生效")
+        return True
+    if ad_seen:
+        log.info("广告已看完，等待服务端确认时长到账（主循环将校验时间）")
+        return True
+    # 无任何广告/弹窗/确认信号：退回 wire 方法直调
+    log.info("未检测到广告/弹窗，尝试 wire 方法直调...")
+    try:
+        call_result = str(sb.execute_script(_LW_CALL_BUTTON_JS))
+        log.info(f"按钮 wire 方法直调: {call_result}")
+    except Exception as e:
+        log.warning(f"按钮 wire 方法直调异常: {e}")
+    time.sleep(4)
+    ts_after2 = get_expires_ts(sb)
+    if ts_after2 and ts_before and ts_after2 > ts_before:
+        log.info(f"✅ wire 直调后 expiresTimestamp {ts_before} -> {ts_after2}")
+        return True
+    log.warning("无广告无弹窗且 expiresTimestamp 未变，本轮判定未生效（不刷新页面，冷却后重试）")
     return False
 
 
@@ -878,8 +957,9 @@ def run():
                 log.info(f"已接近 {MAX_HOURS}h 上限，停止续期")
                 break
 
-            # Step 4.1: 站点真实续期机制 = console 页 "+ 90 min" 免费按钮，优先走 click_renew_button；
-            # 仅在其失败时才退回 Livewire extend（避免旧 Livewire 逻辑假成功跳过硬续期）
+            # Step 4.1: 站点真实续期机制 = console 页 "+ 90 min" 免费按钮（看广告得时长，v5 机制）；
+            # 点击前记录服务端 expiresTimestamp 基线，点击后以其增加为真值判定
+            old_ts = get_expires_ts(sb)
             log.info("尝试点击续期按钮（+90 min）...")
             if click_renew_button(sb):
                 log.info("✅ 按钮点击续期已触发")
@@ -924,15 +1004,19 @@ def run():
             human_sleep(3.0, 5.0)
             sb.sleep(2)
 
-            # Step 4.4: 对比时间
+            # Step 4.4: 对比时间（UI 倒计时 + 服务端 expiresTimestamp 双真值）
             new_sec = get_remaining_seconds(sb)
+            new_ts = get_expires_ts(sb)
             delta = new_sec - last_sec
             log.info(f"点击 #{click_count+1}: {last_sec}s -> {new_sec}s (Delta={delta}s)")
+            if old_ts and new_ts:
+                log.info(f"expiresTimestamp: {old_ts} -> {new_ts}")
 
-            if new_sec > last_sec:
+            ts_grew = (old_ts and new_ts and new_ts > old_ts)
+            if new_sec > last_sec or ts_grew:
                 click_count += 1
                 fail_streak = 0
-                log.info(f"续期成功 #{click_count} (+{new_sec - last_sec}s)")
+                log.info(f"续期成功 #{click_count} (+{new_sec - last_sec}s)" + (" [expiresTs确认]" if ts_grew else ""))
                 screenshot(sb, f"success_{click_count}")
                 last_sec = new_sec
             else:
@@ -940,7 +1024,7 @@ def run():
                 log.warning(f"续期可能失败，时间未增加（连续 {fail_streak}/3）")
                 screenshot(sb, f"fail_{click_count}")
                 capture_renew_response(sb)
-                sb.refresh()
+                # 不 refresh —— 刷新会打断正在进行的广告续期流程（v5 机制）
                 sb.sleep(3)
                 last_sec = get_remaining_seconds(sb)
                 # 连续未生效：主动走 Livewire 方法直调兜底，避免空转
@@ -949,7 +1033,8 @@ def run():
                     log.info(f"Livewire 兜底: {lw_result['results']} success={lw_result['success']}")
                     sb.sleep(5)
                     new_sec2 = get_remaining_seconds(sb)
-                    if new_sec2 > last_sec:
+                    new_ts2 = get_expires_ts(sb)
+                    if new_sec2 > last_sec or (old_ts and new_ts2 and new_ts2 > old_ts):
                         log.info(f"Livewire 兜底成功: {last_sec}s -> {new_sec2}s")
                         click_count += 1
                         fail_streak = 0

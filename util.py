@@ -194,6 +194,36 @@ _LW_CALL_BUTTON_JS = """
 })();
 """
 
+# 点击广告容器内"继续/领取/关闭"按钮（广告结束后领取时长，避免奖励丢失）。
+# 返回: clicked:<文案> / ad_running / no_ad / error:
+_AD_CLICK_JS = """
+(function(){
+    try {
+        var host = null;
+        var nodes = document.querySelectorAll('.vm-ad, .ad-modal, [class*="reward-ad"], [class*="watch-ad"], .ad-container, [data-ad]');
+        for (var i = 0; i < nodes.length; i++) {
+            var r = nodes[i].getBoundingClientRect();
+            if (r.width > 0 && r.height > 0) { host = nodes[i]; break; }
+        }
+        if (host) {
+            var btns = host.querySelectorAll('button, a, [role=button]');
+            for (var j = 0; j < btns.length; j++) {
+                var b = btns[j], bt = (b.innerText || '').trim();
+                if (!bt || b.disabled) continue;
+                var rr = b.getBoundingClientRect();
+                if (rr.width === 0 || rr.height === 0) continue;
+                if (/claim|continue|collect|get\\s*\\d|done|resume/i.test(bt) && !/[$￥¥€]/.test(bt)) {
+                    b.click();
+                    return 'clicked:' + bt.substring(0, 30);
+                }
+            }
+            return 'ad_running';
+        }
+        return 'no_ad';
+    } catch(e) { return 'error:' + e.message; }
+})();
+"""
+
 _LW_V2_JS = """
 (function(){
     try {
