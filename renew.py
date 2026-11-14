@@ -1065,17 +1065,47 @@ def click_renew_button(sb) -> bool:
             log.warning(f"合成点击异常: {e}")
             return False
 
-    # 4) 点击后统一等待（最多约 90s）：广告播放 -> 播完点领取；或确认弹窗/Turnstile
+    # 4) 点击后统一等待（最多约 120s）：
+    #    点击 → g4fRewarded.request()（~5s no_fill）→ showExtendCaptcha → #g4f-ts-modal
+    #    → Turnstile 挑战 → token → 站点回调(_g4fTsCallback) 自动完成续期。
+    #    旧循环不认识 #g4f-ts-modal，模态开着却一直报 no_modal，白白错过整个流程。
     ad_seen = False
     no_modal_rounds = 0
     token_ok_rounds = 0
-    ts_rendered = False
-    for wait_round in range(30):
+    g4f_rendered = False      # 是否已手动补渲染过 widget
+    ts_clicks = 0             # Turnstile checkbox 点击次数
+    diag_rendered = False     # 通用 try_render_turnstile 是否已跑过
+    for wait_round in range(40):
         try:
             state = str(sb.execute_script("""
         (function(){
         function visible(el){ var r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; }
-        // 广告容器/iframe（Playwire 等）
+        // ── g4f Turnstile 流程（最高优先级）──
+        var tins = document.querySelectorAll('[name="cf-turnstile-response"]');
+        for (var ti = 0; ti < tins.length; ti++) {
+            if (tins[ti].value && tins[ti].value.length > 20) return 'ts_token_ok';
+        }
+        var g4fModal = document.getElementById('g4f-ts-modal');
+        if (g4fModal && g4fModal.style.display === 'flex') {
+            var wid = String(window._g4fTsWidgetId);
+            var cfIfr = null;
+            (function findIfr(root) {
+                if (cfIfr) return;
+                var f = root.querySelector('iframe[src*="challenges.cloudflare.com"]');
+                if (f) { cfIfr = f; return; }
+                var els = root.querySelectorAll('*');
+                for (var i = 0; i < els.length; i++) {
+                    if (els[i].shadowRoot) findIfr(els[i].shadowRoot);
+                    if (cfIfr) return;
+                }
+            })(document);
+            if (cfIfr) {
+                var fr = cfIfr.getBoundingClientRect();
+                return 'ts_iframe:x=' + Math.round(fr.left) + ',y=' + Math.round(fr.top) + ',w=' + Math.round(fr.width) + ',h=' + Math.round(fr.height);
+            }
+            return 'ts_modal:wid=' + wid;
+        }
+        // ── 广告容器/iframe（watchWebAd ready 路径）──
         var adVisible = 0;
         var adIframes = document.querySelectorAll('iframe[src*="playwire"], iframe[src*="swapscape"], iframe[src*="reward"], .vm-ad iframe, [class*="ad-iframe"] iframe');
         for (var a = 0; a < adIframes.length; a++) { if (visible(adIframes[a])) adVisible++; }
@@ -1137,6 +1167,71 @@ def click_renew_button(sb) -> bool:
             log.warning(f"弹窗/广告检测异常: {e}")
             state = 'no_modal'
 
+        if state == "ts_token_ok":
+            token_ok_rounds += 1
+            no_modal_rounds = 0
+            if token_ok_rounds >= 2:
+                log.info("✅ Turnstile token 已就绪，站点回调将自动完成续期")
+                return True
+            time.sleep(2)
+            continue
+
+        if state.startswith("ts_iframe:"):
+            # 挑战 iframe 可见：CDP 受信任点击 checkbox 位置（左侧中部）
+            m = re.search(r"x=(\d+),y=(\d+),w=(\d+),h=(\d+)", state)
+            if m and ts_clicks < 3:
+                ts_clicks += 1
+                cx = int(m.group(1)) + min(30, int(m.group(3)) // 3)
+                cy = int(m.group(2)) + int(m.group(4)) // 2
+                try:
+                    sb.driver.execute_cdp_cmd("Input.dispatchMouseEvent",
+                        {"type": "mousePressed", "x": cx, "y": cy, "button": "left", "clickCount": 1})
+                    sb.driver.execute_cdp_cmd("Input.dispatchMouseEvent",
+                        {"type": "mouseReleased", "x": cx, "y": cy, "button": "left", "clickCount": 1})
+                    log.info(f"已点击 Turnstile 挑战框 ({cx},{cy})，等待 token... (第{ts_clicks}次)")
+                except Exception as e:
+                    log.warning(f"Turnstile 点击异常: {e}")
+            time.sleep(4)
+            continue
+
+        if state.startswith("ts_modal:wid=null"):
+            # 站点 turnstile.render 没成功（teleport 时序/脚本问题）→ 手动补渲染，
+            # 复用站点回调链：真 token 照常流入 _g4fTsCallback，服务端校验可过
+            if not g4f_rendered:
+                g4f_rendered = True
+                try:
+                    rr = sb.execute_script("""
+                    (function(){
+                    try {
+                        if (typeof turnstile === 'undefined') return 'no_turnstile';
+                        var w = document.getElementById('g4f-ts-widget');
+                        if (!w) { w = document.createElement('div'); w.id = 'g4f-ts-widget'; document.body.appendChild(w); }
+                        window._g4fTsWidgetId = turnstile.render('#g4f-ts-widget', {
+                            sitekey: '0x4AAAAAADWeWAriMB7Vsqya',
+                            theme: 'dark',
+                            callback: function(tok) {
+                                g4fCloseTurnstile();
+                                if (window._g4fTsCallback) { window._g4fTsCallback(tok); window._g4fTsCallback = null; }
+                            }
+                        });
+                        return 'rendered:' + window._g4fTsWidgetId;
+                    } catch(e) { return 'error:' + e.message; }
+                    })();
+                    """)
+                    log.info(f"站点未渲染 Turnstile widget，手动补渲染: {rr}")
+                except Exception as e:
+                    log.warning(f"手动渲染异常: {e}")
+            elif wait_round % 5 == 0:
+                log.info(f"Turnstile 模态打开（补渲染已尝试）: {state[:60]}, {wait_round+1}/40")
+            time.sleep(3)
+            continue
+
+        if state.startswith("ts_modal:wid="):
+            if wait_round % 5 == 0:
+                log.info(f"Turnstile 模态打开，等待挑战/token... ({state[:70]}, {wait_round+1}/40)")
+            time.sleep(3)
+            continue
+
         if state == "ad_playing":
             ad_seen = True
             if wait_round % 5 == 0:
@@ -1155,7 +1250,7 @@ def click_renew_button(sb) -> bool:
             continue
 
         if state.startswith("clicked:enable_ads"):
-            log.info("已点击 enable ads，继续等待...")
+            log.info("已点击 enable ads，继续等待确认...")
         elif state.startswith("clicked:"):
             # 弹窗/Turnstile 里的确认按钮已点。若刚播完广告，再点一次容器内「领取/继续」
             if ad_seen:
@@ -1186,9 +1281,9 @@ def click_renew_button(sb) -> bool:
             no_modal_rounds = 0
             token_ok_rounds = 0
             if wait_round % 5 == 0:
-                log.info(f"等待验证码/弹窗... ({state}, {wait_round+1}/30)")
-            if not ts_rendered and state == "waiting:token_missing" and wait_round >= 10:
-                ts_rendered = True
+                log.info(f"等待验证码/弹窗... ({state}, {wait_round+1}/40)")
+            if not diag_rendered and state == "waiting:token_missing" and wait_round >= 10:
+                diag_rendered = True
                 try_render_turnstile(sb)
         time.sleep(3)
 
