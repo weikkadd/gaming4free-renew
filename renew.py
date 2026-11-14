@@ -713,7 +713,7 @@ def probe_livewire_methods(sb):
                 try { name = (comps[i].snapshot && comps[i].snapshot.memo && comps[i].snapshot.memo.name) || ''; } catch(e) {}
                 targets.push({c: comps[i], name: name || ('comp#' + i)});
             }
-            var METHODS = ['watchAd', 'claimAd', 'claimAdReward', 'rewardAd', 'startAd', 'extend'];
+            var METHODS = ['watchAd', 'claimAd', 'claimAdReward', 'rewardAd', 'startAd', 'extend', 'extendWebAd'];
             window.__probeResults = [];
             var chain = Promise.resolve();
             function probeComp(c, label) {
@@ -729,7 +729,8 @@ def probe_livewire_methods(sb):
             }
             // 全组件扫描基础方法
             for (var k = 0; k < targets.length; k++) probeComp(targets[k].c, targets[k].name);
-            // extend 带参变体：在每个组件上试一次 extend(90)
+            // extend 带参变体：extend(90)=当分钟数；extend(假token)=测服务端是否真校验 Turnstile token——
+            // extendClicked 源码显示正常路径是 $wire.extend(tok)，若服务端只查非空字符串则假 token 直接续期成功（判定看 expiresTimestamp 是否变化）
             targets.forEach(function(t) {
                 chain = chain.then(function() {
                     return t.c.$wire.call('extend', 90).then(function(resp) {
@@ -738,8 +739,15 @@ def probe_livewire_methods(sb):
                         window.__probeResults.push({c: t.name, m: 'extend(90)', ok: false, e: String((err && err.message) || err).substring(0, 120)});
                     });
                 });
+                chain = chain.then(function() {
+                    return t.c.$wire.call('extend', 'g4f-diag-token-probe-7f3a').then(function(resp) {
+                        window.__probeResults.push({c: t.name, m: 'extend(fake-token)', ok: true, r: JSON.stringify(resp).substring(0, 200)});
+                    }).catch(function(err) {
+                        window.__probeResults.push({c: t.name, m: 'extend(fake-token)', ok: false, e: String((err && err.message) || err).substring(0, 120)});
+                    });
+                });
             });
-            return 'probing_' + targets.length + 'x' + (METHODS.length + 1);
+            return 'probing_' + targets.length + 'x' + (METHODS.length + 2);
         } catch(e) { return 'error:' + e.message; }
         })();
         """)
@@ -1027,6 +1035,9 @@ def click_renew_button(sb) -> bool:
     try:
         result = str(sb.execute_script("""
         (function(){
+        // 点击前关闭上一轮残留的 Turnstile 模态（showExtendCaptcha 会开 _g4fTsModal 盖住按钮，
+        // 实测日志 hit=blocked_by:DIV. 就是这个遮罩挡住了按钮中心导致点击落在遮罩上）
+        try { if (window.g4fCloseTurnstile) window.g4fCloseTurnstile(); } catch(e) {}
         var candidates = document.querySelectorAll('button, a, [role=button], [wire\\\\:click], [wire\\\\:click\\\\.prevent]');
         for (var i = 0; i < candidates.length; i++) {
             var el = candidates[i];
