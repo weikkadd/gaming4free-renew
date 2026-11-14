@@ -42,7 +42,7 @@ else:
 MAX_HOURS      = 48            # 续期上限 48 小时
 ADD_MINUTES    = 90            # 每次续期 +90 分钟（console 页 "+ 90 min" 按钮）
 COOLDOWN_SEC   = 240           # 冷却 4 分钟
-MAX_CLICKS     = 80            # 单次运行最大投票次数
+MAX_CLICKS     = 32            # 单次运行最大续期次数（48h 上限需 32 次 +90min；每轮约 4.5min，适配 GHA 180min 超时）
 PAGE_TIMEOUT   = 60            # 单页操作超时
 TURNSTILE_WAIT = 90            # Turnstile 等待上限
 
@@ -78,7 +78,7 @@ def tg(msg: str):
     try:
         r = requests.post(
             f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            json={"chat_id": TG_CHAT_ID, "text": msg, "parse_mode": "HTML"},
+            json={"chat_id": TG_CHAT_ID, "text": msg},
             timeout=10,
         )
         r.raise_for_status()
@@ -232,11 +232,21 @@ def get_remaining_seconds(sb) -> int:
 
 
 def livewire_extend(sb) -> dict:
-    """使用 Livewire JavaScript 直接调用 extend 方法，返回结果"""
-    from util import _LW_EXTEND_V3_JS, _LW_V2_JS, _LW_CLICK_JS
-    
+    """使用 Livewire JavaScript 直接调用续期方法，返回结果"""
+    from util import _LW_CALL_BUTTON_JS, _LW_EXTEND_V3_JS, _LW_V2_JS, _LW_CLICK_JS
+
     results = []
-    
+
+    # 策略0: 按按钮真实 wire:click 方法名直调（原生 el.click() 可能未被 Livewire 事件管线接住，
+    # GHA 日志表现为 __lwResponses 为空、剩余时间只降不升）
+    try:
+        result = sb.execute_script(_LW_CALL_BUTTON_JS)
+        if result:
+            log.info(f"按钮直调结果: {result}")
+            results.append(str(result))
+    except Exception as e:
+        log.warning(f"按钮直调失败: {e}")
+
     # 策略1: Livewire v3 - $wire.call('extend')
     try:
         result = sb.execute_script(_LW_EXTEND_V3_JS)
@@ -264,10 +274,12 @@ def livewire_extend(sb) -> dict:
     except Exception as e:
         log.warning(f"按钮点击失败: {e}")
     
-    # 只认真正的 Livewire extend 调用（call_extend/direct_extend/emit_extend），
-    # 不认按钮点击结果——_LW_CLICK_JS 可能点中非续期元素（如 <html>）造成假成功
+    # 成功判定：按钮直调真实方法名（btn_call/btn_emit）或 Livewire extend 调用。
+    # 不认原生点击（btn_native/旧 clicked:）——可能未进 Livewire 管线造成假成功，
+    # 由 click_renew_button 内的 __lwResponses 校验兜底。
     return {"results": results, "success": any(
-        ("call_extend" in r.lower() or "direct_extend" in r.lower() or "emit_extend" in r.lower())
+        (r.lower().startswith("btn_call:") or r.lower().startswith("btn_emit:")
+         or "call_extend" in r.lower() or "direct_extend" in r.lower() or "emit_extend" in r.lower())
         for r in results
     )}
 
@@ -472,12 +484,15 @@ def capture_renew_response(sb):
 
 
 def click_renew_button(sb) -> bool:
-    """gaming4free 续期：点击 console 页 '+ 90 min' 免费按钮（'+24h $x' 付费按钮不碰）"""
-    # 安装 Livewire 请求捕获 hook（失败不影响点击）
+    """gaming4free 续期：点击 console 页 '+ 90 min' 免费按钮（'+24h $x' 付费按钮不碰）。
+    点击后用请求捕获 hook 校验是否真的发出 Livewire 请求，被吞时退回按钮 wire 方法直调。"""
+    from util import _LW_CALL_BUTTON_JS
+    # 安装 Livewire 请求捕获 hook（失败不影响点击），并记录响应计数基线
     try:
         sb.execute_script(_LW_HOOK_JS)
+        lw_before = int(sb.execute_script("return (window.__lwResponses || []).length;") or 0)
     except Exception:
-        pass
+        lw_before = 0
     try:
         result = sb.execute_script("""
         (function(){
@@ -571,9 +586,33 @@ def click_renew_button(sb) -> bool:
         elif state == "no_modal":
             no_modal_rounds += 1
             token_ok_rounds = 0
+            # 无弹窗时校验点击是否真的发出了 Livewire 请求；
+            # 原生 el.click() 可能未被 Livewire 事件管线接住（请求根本没发出），
+            # 表现为 __lwResponses 计数不增加 —— 此时退回按钮 wire 方法直调
             if no_modal_rounds >= 3:
-                log.info("无确认弹窗，点击即完成续期")
-                return True
+                try:
+                    lw_after = int(sb.execute_script("return (window.__lwResponses || []).length;") or 0)
+                except Exception:
+                    lw_after = lw_before
+                if lw_after > lw_before:
+                    log.info(f"无确认弹窗，已捕获 {lw_after - lw_before} 条 Livewire 请求，点击生效")
+                    return True
+                log.warning("无确认弹窗且未捕获到 Livewire 请求 —— 点击可能未进 Livewire 管线，退回 wire 方法直调...")
+                try:
+                    call_result = sb.execute_script(_LW_CALL_BUTTON_JS)
+                    log.info(f"按钮 wire 方法直调: {call_result}")
+                except Exception as e:
+                    log.warning(f"按钮 wire 方法直调异常: {e}")
+                time.sleep(3)
+                try:
+                    lw_after2 = int(sb.execute_script("return (window.__lwResponses || []).length;") or 0)
+                except Exception:
+                    lw_after2 = lw_after
+                if lw_after2 > lw_after:
+                    log.info(f"wire 方法直调后捕获 {lw_after2 - lw_after} 条 Livewire 请求，视为已触发")
+                    return True
+                log.warning("wire 方法直调后仍无 Livewire 请求，本次点击判定为未生效")
+                return False
         elif state == "waiting:token_ok":
             token_ok_rounds += 1
             no_modal_rounds = 0
@@ -675,7 +714,7 @@ def inject_cookies(sb):
 def do_login(sb):
     """登录逻辑（如有）"""
     if not USERNAME:
-        log.info("未配置 MC_USERNAME，跳过登录")
+        log.info("未配置 GAME4FREE_USERNAME，跳过登录")
         return
     log.info(f"尝试登录用户: {USERNAME}")
 
@@ -730,7 +769,7 @@ def run():
     log.info("gaming4free 续期启动")
     log.info(f"代理地址: {PROXY_URL}")
     log.info(f"目标站点: {SITE_URL}")
-    log.info(f"MC 用户:  {USERNAME or '(未配置)'}")
+    log.info(f"用户名:  {USERNAME or '(未配置)'}")
     log.info("=" * 60)
 
     # 预检代理端口
@@ -825,6 +864,7 @@ def run():
         # Step 4: 主循环 - 反复点击续期直到接近 48h
         click_count = 0
         no_btn_streak = 0          # 连续找不到续期入口的次数
+        fail_streak = 0           # 连续剩余时间未增加（点击未生效）的次数
         last_sec = get_remaining_seconds(sb)
         log.info(f"初始剩余: {last_sec}s ({fmt_hm(last_sec)})")
 
@@ -891,25 +931,42 @@ def run():
 
             if new_sec > last_sec:
                 click_count += 1
-                log.info(f"续期成功 (累计 {click_count} 次)")
+                fail_streak = 0
+                log.info(f"续期成功 #{click_count} (+{new_sec - last_sec}s)")
                 screenshot(sb, f"success_{click_count}")
                 last_sec = new_sec
             else:
-                log.warning("续期可能失败，时间未增加")
+                fail_streak += 1
+                log.warning(f"续期可能失败，时间未增加（连续 {fail_streak}/3）")
                 screenshot(sb, f"fail_{click_count}")
                 capture_renew_response(sb)
                 sb.refresh()
                 sb.sleep(3)
                 last_sec = get_remaining_seconds(sb)
+                # 连续未生效：主动走 Livewire 方法直调兜底，避免空转
+                if fail_streak >= 2:
+                    lw_result = livewire_extend(sb)
+                    log.info(f"Livewire 兜底: {lw_result['results']} success={lw_result['success']}")
+                    sb.sleep(5)
+                    new_sec2 = get_remaining_seconds(sb)
+                    if new_sec2 > last_sec:
+                        log.info(f"Livewire 兜底成功: {last_sec}s -> {new_sec2}s")
+                        click_count += 1
+                        fail_streak = 0
+                        last_sec = new_sec2
+                if fail_streak >= 3:
+                    log.error(f"连续 {fail_streak} 次续期未生效，终止本轮")
+                    tg(f"❌ gaming4free 续期失败：连续 {fail_streak} 次点击未生效\n最终剩余: {fmt_hm(last_sec)}")
+                    return
                 click_count += 1
 
             # 冷却
             if last_sec >= (MAX_HOURS - 1) * 3600:
                 break
             log.info(f"冷却 {COOLDOWN_SEC}s ...")
-            for i in range(COOLDOWN_SEC, 0, -10):
+            for i in range(COOLDOWN_SEC, 0, -30):
                 log.info(f"  剩 {i}s")
-                time.sleep(10)
+                time.sleep(30)
 
         # 收尾
         final_sec = get_remaining_seconds(sb)

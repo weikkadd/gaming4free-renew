@@ -8,8 +8,9 @@ GitHub Actions + SeleniumBase UC mode + Cloudflare Turnstile 验证。
 
 ```
 gaming4free-renew/
-├── renew.py          # 主脚本 (单文件, 无外部模块依赖)
-├── requirements.txt  # Python 依赖
+├── renew.py          # 主脚本（入口）
+├── util.py           # 辅助模块：Livewire JS 片段（renew.py 运行时导入）
+├── requirements.txt  # Python 依赖（seleniumbase、requests）
 └── README.md         # 说明文档
 ```
 
@@ -21,7 +22,7 @@ gaming4free-renew/
 |---|---|---|
 | `GAME4FREE_RENEW_URL` | 单账号 | 续期页面 URL |
 | `GAME4FREE_COOKIE` | 单账号 | Cookie 字符串 |
-| `GAME4FREE_ACCOUNTS` | 多账号 | 每行 `名称\|\|\|URL\|\|\|Cookie` |
+| `GAME4FREE_ACCOUNTS` | 否 | 多账号格式 `名称\|\|\|URL\|\|\|Cookie`（当前 renew.py 暂未解析，预留） |
 | `TG_BOT_TOKEN` | 否 | Telegram Bot Token |
 | `TG_CHAT_ID` | 否 | Telegram Chat ID |
 

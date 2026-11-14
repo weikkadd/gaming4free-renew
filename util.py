@@ -101,7 +101,7 @@ _LW_EXTEND_V3_JS = """
     try {
         var wireEls = document.querySelectorAll('[wire\\\\:id]');
         for (var i = 0; i < wireEls.length; i++) {
-            var wireId = wireEls[i].getAttribute('wire\\\\:id');
+            var wireId = wireEls[i].getAttribute('wire:id');
             if (wireId) {
                 var component = Livewire.find(wireId);
                 if (component && component.$wire) {
@@ -123,7 +123,7 @@ _LW_EXTEND_V3_JS = """
         }
         var wireEls2 = document.querySelectorAll('[wire\\\\:id]');
         for (var j = 0; j < wireEls2.length; j++) {
-            var wid = wireEls2[j].getAttribute('wire\\\\:id');
+            var wid = wireEls2[j].getAttribute('wire:id');
             if (wid) {
                 try {
                     var comp = window.livewire || window.Livewire;
@@ -139,6 +139,61 @@ _LW_EXTEND_V3_JS = """
 })();
 """
 
+# 优先触发器：读取按钮真实的 wire:click 方法名，走 Livewire 官方管线直调。
+# 旧逻辑用原生 el.click() 派发合成事件，若点中的元素/事件不被 Livewire 事件管线接住，
+# 请求根本不会发出（GHA 日志表现为 __lwResponses 为空、时间只降不升）。
+# 返回码: btn_call: / btn_emit: / btn_native: / not_found / disabled / error:
+_LW_CALL_BUTTON_JS = """
+(function(){
+    try {
+        var candidates = document.querySelectorAll('button, a, [role=button]');
+        var target = null, wireAttr = null;
+        for (var i = 0; i < candidates.length; i++) {
+            var el = candidates[i];
+            var t = (el.innerText || el.textContent || '').trim();
+            if (!t || t.length > 60) continue;
+            if (t.indexOf('90') === -1 || t.toLowerCase().indexOf('min') === -1) continue;
+            if (/[$￥¥€]/.test(t) || /24\\s*h/i.test(t)) continue;
+            var r = el.getBoundingClientRect();
+            if (r.width === 0 || r.height === 0) continue;
+            if (el.disabled) continue;
+            target = el;
+            var attrs = ['wire:click', 'wire:click.prevent', 'wire:click.stop'];
+            for (var a = 0; a < attrs.length; a++) {
+                var attr = el.getAttribute(attrs[a]);
+                if (attr) { wireAttr = attr; break; }
+            }
+            break;
+        }
+        if (!target) return 'not_found';
+
+        // 从 wire 属性提取真实方法名: "extend()" / "$wire.extend()" -> extend
+        if (wireAttr) {
+            var method = wireAttr.split('(')[0].replace('$wire.', '').trim();
+            var wid = target.getAttribute('wire:id');
+            if (!wid && target.parentElement) wid = target.parentElement.getAttribute('wire:id');
+            if (method && wid && window.Livewire) {
+                var comp = null;
+                try { comp = Livewire.find(wid); } catch(e) {}
+                if (!comp && Livewire.componentsById) comp = Livewire.componentsById[wid];
+                if (comp && comp.$wire) {
+                    comp.$wire.call(method);
+                    return 'btn_call:' + method + ':wire=' + wid;
+                }
+            }
+            if (method && window.livewire) {
+                window.livewire.emit(method);
+                return 'btn_emit:' + method;
+            }
+        }
+        // 无 wire 属性或拿不到方法名：退回原生点击
+        target.scrollIntoView({block: 'center'});
+        target.click();
+        return 'btn_native:' + target.tagName + ':wire=' + (wireAttr || 'none');
+    } catch(e) { return 'error:' + e.message; }
+})();
+"""
+
 _LW_V2_JS = """
 (function(){
     try {
@@ -149,7 +204,7 @@ _LW_V2_JS = """
             var el = allEls[i];
             var t = (el.innerText || el.textContent || '').trim();
             if (t.indexOf('90') !== -1 && t.indexOf('min') !== -1) {
-                var wc = el.getAttribute('wire\\\\:click') || el.getAttribute('wire\\\\:click\\\\.prevent');
+                var wc = el.getAttribute('wire:click') || el.getAttribute('wire:click.prevent');
                 if (wc) {
                     var methodName = wc.replace(/[()]/g, '').replace(/\\$wire\\./g, '').trim();
                     if (window.livewire) { window.livewire.emit(methodName); return 'v2_emit_' + methodName; }
@@ -174,7 +229,7 @@ _LW_CLICK_JS = """
                 var rect = el.getBoundingClientRect();
                 if (rect.width > 0 && rect.height > 0 && !el.disabled) {
                     target = el;
-                    var attrs = ['wire\\\\:click', 'wire\\\\:click\\\\.prevent', 'wire\\\\:click\\\\.stop'];
+                    var attrs = ['wire:click', 'wire:click.prevent', 'wire:click.stop'];
                     for (var a = 0; a < attrs.length; a++) {
                         var attr = el.getAttribute(attrs[a]);
                         if (attr) { wireAttr = attrs[a] + '=' + attr; break; }
@@ -207,10 +262,10 @@ _LW_DIAGNOSE_JS = """
     info.wire_ids = [];
     for (var i = 0; i < wireEls.length; i++) {
         info.wire_ids.push({
-            id: wireEls[i].getAttribute('wire\\\\:id'),
+            id: wireEls[i].getAttribute('wire:id'),
             tag: wireEls[i].tagName,
             class: (wireEls[i].className || '').substring(0, 80),
-            wireClick: wireEls[i].getAttribute('wire\\\\:click') || wireEls[i].getAttribute('wire\\\\:click\\\\.prevent') || 'none'
+            wireClick: wireEls[i].getAttribute('wire:click') || wireEls[i].getAttribute('wire:click.prevent') || 'none'
         });
     }
     var btns = [];
@@ -221,7 +276,7 @@ _LW_DIAGNOSE_JS = """
         if (t.indexOf('90') !== -1 && t.indexOf('min') !== -1) {
             btns.push({
                 tag: el.tagName, text: t.substring(0, 40), disabled: el.disabled,
-                wireClick: el.getAttribute('wire\\\\:click') || el.getAttribute('wire\\\\:click\\\\.prevent') || 'none',
+                wireClick: el.getAttribute('wire:click') || el.getAttribute('wire:click.prevent') || 'none',
                 onClick: el.getAttribute('onclick') || 'none',
                 class: (el.className || '').substring(0, 80),
                 html: el.outerHTML.substring(0, 200)
