@@ -1148,7 +1148,9 @@ def click_renew_button(sb) -> bool:
     g4f_rendered = False      # 是否已手动补渲染过 widget
     ts_clicks = 0             # Turnstile checkbox 点击次数
     diag_rendered = False     # 通用 try_render_turnstile 是否已跑过
-    for wait_round in range(40):
+    # Turnstile 挑战实测（2026-11-15）在几分钟内自动放行（无人点击），40 轮×3s=120s 太短会提前放弃；
+    # 100 轮×3s=300s 给 CF 自动放行足够时间
+    for wait_round in range(100):
         try:
             state = str(sb.execute_script("""
         (function(){
@@ -1334,13 +1336,13 @@ def click_renew_button(sb) -> bool:
                 except Exception as e:
                     log.warning(f"手动渲染异常: {e}")
             elif wait_round % 5 == 0:
-                log.info(f"Turnstile 模态打开（补渲染已尝试）: {state[:60]}, {wait_round+1}/40")
+                log.info(f"Turnstile 模态打开（补渲染已尝试）: {state[:60]}, {wait_round+1}/100")
             time.sleep(3)
             continue
 
         if state.startswith("ts_modal:wid="):
             if wait_round % 5 == 0:
-                log.info(f"Turnstile 模态打开，等待挑战/token... ({state[:70]}, {wait_round+1}/40)")
+                log.info(f"Turnstile 模态打开，等待挑战/token... ({state[:70]}, {wait_round+1}/100)")
             time.sleep(3)
             continue
 
@@ -1393,7 +1395,7 @@ def click_renew_button(sb) -> bool:
             no_modal_rounds = 0
             token_ok_rounds = 0
             if wait_round % 5 == 0:
-                log.info(f"等待验证码/弹窗... ({state}, {wait_round+1}/40)")
+                log.info(f"等待验证码/弹窗... ({state}, {wait_round+1}/100)")
             if not diag_rendered and state == "waiting:token_missing" and wait_round >= 10:
                 diag_rendered = True
                 try_render_turnstile(sb)
@@ -1667,6 +1669,9 @@ def run():
         fail_streak = 0           # 连续剩余时间未增加（点击未生效）的次数
         last_sec = get_remaining_seconds(sb)
         log.info(f"初始剩余: {last_sec}s ({fmt_hm(last_sec)})")
+        # 运行初始服务端 expiresTimestamp：异步续期到账的累计判定基准——Turnstile 挑战可能在浏览器后台
+        # 几分钟后才自动放行，$wire.extend(tok) 到账发生在相邻两轮判定之间，单轮 delta 测不到
+        initial_ts = get_expires_ts(sb)
 
         if last_sec < 0 and not st.get("btn_90min"):
             log.warning("未检测到剩余时间倒计时，且页面上没有续期按钮 —— "
@@ -1734,12 +1739,22 @@ def run():
                 log.info(f"expiresTimestamp: {old_ts} -> {new_ts}")
 
             ts_grew = (old_ts and new_ts and new_ts > old_ts)
+            # 异步到账检测：实测（2026-11-15）Turnstile 挑战在浏览器后台自动放行后 $wire.extend(tok) 才生效，
+            # 到账发生在两轮判定之间 → old_ts 读数已含增益 → ts_grew/delta 双双失效误判失败。
+            # 用相对运行初始值的累计增益兜底：≥3000s 必然有一次 +90min 到账，按成功计并重置连续失败计数
+            total_gain = (new_ts - initial_ts) if (new_ts and initial_ts) else 0
             if new_sec > last_sec or ts_grew:
                 click_count += 1
                 fail_streak = 0
                 log.info(f"续期成功 #{click_count} (+{new_sec - last_sec}s)" + (" [expiresTs确认]" if ts_grew else ""))
                 screenshot(sb, f"success_{click_count}")
                 last_sec = new_sec
+            elif total_gain >= 3000:
+                click_count += 1
+                fail_streak = 0
+                last_sec = new_sec
+                log.info(f"上轮续期异步到账: 运行以来服务端时长累计 +{total_gain}s ({total_gain//60}min)，按成功计")
+                screenshot(sb, f"async_success_{click_count}")
             else:
                 fail_streak += 1
                 log.warning(f"续期可能失败，时间未增加（连续 {fail_streak}/3）")
