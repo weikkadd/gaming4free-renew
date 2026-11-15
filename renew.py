@@ -1146,9 +1146,10 @@ def click_renew_button(sb) -> bool:
     g4f_rendered = False      # 是否已手动补渲染过 widget
     ts_clicks = 0             # Turnstile checkbox 点击次数
     diag_rendered = False     # 通用 try_render_turnstile 是否已跑过
-    # Turnstile 挑战实测（2026-11-15）在几分钟内自动放行（无人点击），40 轮×3s=120s 太短会提前放弃；
-    # 100 轮×3s=300s 给 CF 自动放行足够时间
-    for wait_round in range(100):
+    # Turnstile 挑战实测（2026-11-15/16）自动放行耗时约 5-7 分钟（无人点击纯后台跑）：
+    # 300s（100轮）差几秒错过放行、120s（40轮）直接超时；600s（200轮）完整覆盖放行窗口，
+    # 等待循环内捕获 token 即可立即判成功，还能省掉失败分支约 2 分钟的诊断流程
+    for wait_round in range(200):
         try:
             state = str(sb.execute_script("""
         (function(){
@@ -1334,13 +1335,13 @@ def click_renew_button(sb) -> bool:
                 except Exception as e:
                     log.warning(f"手动渲染异常: {e}")
             elif wait_round % 5 == 0:
-                log.info(f"Turnstile 模态打开（补渲染已尝试）: {state[:60]}, {wait_round+1}/100")
+                log.info(f"Turnstile 模态打开（补渲染已尝试）: {state[:60]}, {wait_round+1}/200")
             time.sleep(3)
             continue
 
         if state.startswith("ts_modal:wid="):
             if wait_round % 5 == 0:
-                log.info(f"Turnstile 模态打开，等待挑战/token... ({state[:70]}, {wait_round+1}/100)")
+                log.info(f"Turnstile 模态打开，等待挑战/token... ({state[:70]}, {wait_round+1}/200)")
             time.sleep(3)
             continue
 
@@ -1393,7 +1394,7 @@ def click_renew_button(sb) -> bool:
             no_modal_rounds = 0
             token_ok_rounds = 0
             if wait_round % 5 == 0:
-                log.info(f"等待验证码/弹窗... ({state}, {wait_round+1}/100)")
+                log.info(f"等待验证码/弹窗... ({state}, {wait_round+1}/200)")
             if not diag_rendered and state == "waiting:token_missing" and wait_round >= 10:
                 diag_rendered = True
                 try_render_turnstile(sb)
@@ -1777,6 +1778,13 @@ def run():
                 # 不 refresh —— 刷新会打断正在进行的广告续期流程（v5 机制）
                 sb.sleep(3)
                 last_sec = get_remaining_seconds(sb)
+                # 异步到账复查：capture_renew_response 的 probe+JS 扫描耗时约 2 分钟，恰好覆盖 Turnstile
+                # 挑战自动放行的到账窗口（2026-11-16 实测：判定时 ts 未变判失败，probe 结束时 +5400 已到账）——
+                # 此时重读 expiresTimestamp 与运行初始值比对，≥3000s 说明上轮续期实际成功，重置连续失败计数
+                late_ts = get_expires_ts(sb)
+                if initial_ts and late_ts and late_ts - initial_ts >= 3000:
+                    log.info(f"异步到账复查: 服务端时长较运行初始累计 +{late_ts - initial_ts}s，上轮续期实际成功，重置连续失败计数")
+                    fail_streak = 0
                 # 连续未生效：主动走 Livewire 方法直调兜底，避免空转
                 if fail_streak >= 2:
                     lw_result = livewire_extend(sb)
