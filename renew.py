@@ -220,11 +220,9 @@ def get_remaining_seconds(sb) -> int:
         if best > 0:
             log.info(f"剩余时间 [body HH:MM:SS] -> {best}s ({fmt_hm(best)})")
             return best
-        for line in body_text.split("\n"):
-            sec = parse_remaining_seconds(line)
-            if 60 < sec < MAX_HOURS * 3600 + 3600:
-                log.info(f"剩余时间 [body line] = {line.strip()} -> {sec}s")
-                return sec
+        # 不做逐行文案解析——suspended 暂停页的推广文案（"每个广告在应用中获得3小时"）会被
+        # parse_remaining_seconds 误读成剩余时间（实测 21600s），脚本误以为还有 6h 而空转 3 轮。
+        # 只认 HH:MM:SS 倒计时格式，识别不了返回 -1（配合 run() 的 suspended 检测提前退出）
         return -1
     except Exception as e:
         log.warning(f"提取剩余时间失败: {e}")
@@ -1661,6 +1659,22 @@ def run():
             screenshot(sb, "not_logged_in")
             log.error("未登录（被重定向到登录页）：cookie 注入失败或已失效，请更新 GAME4FREE_COOKIE")
             tg(f"❌ gaming4free 续期失败：未登录\n当前页面: {st.get('url', '?')}")
+            return
+
+        # Step 3.6: 服务器暂停页检测 —— 48h cap 到期或会话耗尽后平台把服务器挂到 /suspended，
+        # 该页面没有 +90min 续期按钮（btn_90min=false），续期脚本无法恢复，提前退出避免空转 3 轮
+        # （2026-11-16 实测：cap 00:00:00 → url=/server/{id}/suspended，title="服务器暂停 - Gaming4Free"）
+        if "/suspended" in st.get("url", "") or "suspended" in (st.get("title") or "").lower():
+            dump_html(sb, "suspended_page")
+            screenshot(sb, "suspended_page")
+            log.error("服务器已暂停（48h cap 到期或会话耗尽），页面上没有续期按钮，无法自动续期")
+            # PROBE 终审（2026-11-16）：extendWebAd/extend(fake-token) 直调全部返回 null 且 expiresTimestamp
+            # 恒定不变——服务端真校验，直调终局解不存在；唯一续期路径 = Turnstile 真挑战（活跃会话下已实测自动放行）
+            tg("⚠️ gaming4free 服务器已暂停（suspended）\n"
+               "48h cap 已用完，页面上没有续期按钮，脚本无法自动续期。\n"
+               "恢复方式：①面板手动付费恢复（余额可能够 $0.15）\n"
+               "②手机 App 看广告（每条 +3h）\n"
+               f"页面: {st.get('url', '?')}")
             return
 
         # Step 4: 主循环 - 反复点击续期直到接近 48h
